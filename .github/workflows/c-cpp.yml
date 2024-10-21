@@ -8,7 +8,7 @@ jobs:
     runs-on: windows-latest
     
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Update repo.
       run: |
         git submodule update --init --recursive
@@ -18,16 +18,12 @@ jobs:
       run: make -j
     - name: Build hacPack-Tools
       run: make -C hacPack-Tools/hacPackTools-NACP -j
-    #- name: make build folder
-    #  run: |
-    #    mkdir Out/
-    #    mkdir Out/hacPackTools-NACP/
-    #    mv hacpack* Out/
-    #    mv hacPack-Tools/hacPackTools-NACP/hptnacp* Out/hacPackTools-NACP/
+      
     - name: Upload artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         # Artifact name
         name: Hacpack
         # Directory containing files to upload
-        path: ./
+        path: |
+          *.exe
