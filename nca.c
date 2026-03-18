@@ -22,6 +22,7 @@
 #define NCA_PATCH_GLOBAL_INDEX_MAX_PROBES 8
 #define NCA_PATCH_GLOBAL_INDEX_CANDIDATES 8
 #define NCA_PATCH_FILE_HINT_SAMPLE_SIZE 0x100
+#define NCA_PATCH_INDEX_READ_CHUNK (4U * 1024U * 1024U)
 
 typedef struct
 {
@@ -324,7 +325,6 @@ static void nca_base_block_index_insert(nca_base_block_index_t *index, uint64_t 
 
 static void nca_build_base_block_index(FILE *base_file, uint64_t base_size, nca_base_block_index_t *index)
 {
-    unsigned char block[NCA_PATCH_BLOCK_SIZE];
     uint64_t base_offset = 0;
     uint64_t block_count = base_size / NCA_PATCH_BLOCK_SIZE;
     uint64_t max_slots = NCA_PATCH_GLOBAL_INDEX_MAX_BYTES / sizeof(nca_base_block_index_entry_t);
@@ -350,12 +350,35 @@ static void nca_build_base_block_index(FILE *base_file, uint64_t base_size, nca_
     }
     index->slot_count = slot_count;
 
+    unsigned char *chunk = malloc(NCA_PATCH_INDEX_READ_CHUNK);
+    if (chunk == NULL)
+    {
+        FATAL_ERROR("Failed to allocate base block index read buffer");
+    }
+
+    fseeko64(base_file, 0, SEEK_SET);
     while (base_offset + NCA_PATCH_BLOCK_SIZE <= base_size)
     {
-        nca_read_file_exact(base_file, base_offset, block, sizeof(block), "Failed to read base RomFS section");
-        nca_base_block_index_insert(index, nca_hash_block(block), base_offset);
-        base_offset += NCA_PATCH_BLOCK_SIZE;
+        size_t to_read = NCA_PATCH_INDEX_READ_CHUNK;
+        if (base_offset + to_read > base_size)
+        {
+            to_read = (size_t)(base_size - base_offset);
+        }
+        to_read -= to_read % NCA_PATCH_BLOCK_SIZE;
+
+        if (fread(chunk, 1, to_read, base_file) != to_read)
+        {
+            FATAL_ERROR("Failed to read base RomFS section");
+        }
+
+        for (size_t i = 0; i < to_read; i += NCA_PATCH_BLOCK_SIZE)
+        {
+            nca_base_block_index_insert(index, nca_hash_block(chunk + i), base_offset);
+            base_offset += NCA_PATCH_BLOCK_SIZE;
+        }
     }
+
+    free(chunk);
 }
 
 static uint64_t nca_find_indexed_base_match(const nca_base_block_index_t *index, FILE *base_file, uint64_t base_size, const unsigned char *current_block, FILE *current_file, uint64_t current_size, uint64_t current_offset, uint64_t *out_base_offset)
