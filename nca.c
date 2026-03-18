@@ -79,9 +79,9 @@ static uint64_t nca_get_file_size(FILE *file)
 
 static uint32_t nca_get_section_generation(const nca_fs_header_t *fs_header)
 {
-    uint32_t generation = 0;
-    memcpy(&generation, fs_header->section_ctr, sizeof(generation));
-    return generation;
+    const uint8_t *b = (const uint8_t *)fs_header->section_ctr + 4;
+    return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+           ((uint32_t)b[2] << 8)  |  (uint32_t)b[3];
 }
 
 static int nca_compare_patch_hints(const void *left, const void *right)
@@ -1191,7 +1191,6 @@ static void nca_prepare_romfs_fs_header(nca_fs_header_t *fs_header, uint8_t cryp
 
 static uint64_t nca_build_patch_romfs_section(filepath_t *base_section_path, filepath_t *current_section_path, filepath_t *out_section_path, nca_fs_header_t *fs_header, const nca_patch_hint_t *hints, uint32_t hint_count)
 {
-    bktr_subsection_entry_t subsection_entry;
     FILE *current_section = os_fopen(current_section_path->os_path, OS_MODE_READ);
     if (current_section == NULL)
     {
@@ -1245,14 +1244,24 @@ static uint64_t nca_build_patch_romfs_section(filepath_t *base_section_path, fil
 
     nca_write_padding(patch_section);
 
+    // Set section_ctr generation=1 (big-endian bytes [4..7]) for first-generation patch
+    fs_header->section_ctr[4] = 0;
+    fs_header->section_ctr[5] = 0;
+    fs_header->section_ctr[6] = 0;
+    fs_header->section_ctr[7] = 1;
+
     const uint64_t relocation_offset = (uint64_t)ftello64(patch_section);
     const uint32_t relocation_entry_count = layout.segment_count;
     const uint64_t relocation_table_size = bktr_get_relocation_table_size(relocation_entry_count);
     unsigned char *relocation_table = calloc(1, (size_t)relocation_table_size);
-    subsection_entry.offset = 0;
-    subsection_entry.reserved = 0;
-    subsection_entry.ctr_val = nca_get_section_generation(fs_header);
-    const uint32_t subsection_entry_count = 1;
+    bktr_subsection_entry_t subsection_entries[2];
+    subsection_entries[0].offset = 0;
+    subsection_entries[0].reserved = 0;
+    subsection_entries[0].ctr_val = nca_get_section_generation(fs_header);
+    subsection_entries[1].offset = relocation_offset;
+    subsection_entries[1].reserved = 0;
+    subsection_entries[1].ctr_val = 0;  // BKTR tables region uses generation=0
+    const uint32_t subsection_entry_count = 2;
     const uint64_t subsection_table_size = bktr_get_subsection_table_size(subsection_entry_count);
     unsigned char *subsection_table = calloc(1, (size_t)subsection_table_size);
     if (relocation_table == NULL || subsection_table == NULL)
@@ -1271,7 +1280,8 @@ static uint64_t nca_build_patch_romfs_section(filepath_t *base_section_path, fil
     }
 
     const uint64_t subsection_offset = (uint64_t)ftello64(patch_section);
-    bktr_build_subsection_table(subsection_table, subsection_table_size, subsection_offset, relocation_offset, &subsection_entry, subsection_entry_count);
+    const uint64_t section_size_predicted = subsection_offset + subsection_table_size;
+    bktr_build_subsection_table(subsection_table, subsection_table_size, subsection_offset, section_size_predicted, subsection_entries, subsection_entry_count);
     if (fwrite(subsection_table, 1, (size_t)subsection_table_size, patch_section) != subsection_table_size)
     {
         free(relocation_table);
@@ -2049,8 +2059,139 @@ void nca_encrypt_header(nca_header_t *nca_header, hp_settings_t *settings)
     free_aes_ctx(hdr_aes_ctx);
 }
 
+/* Updates the CTR for a BKTR subsection: sets bytes [4..7] to ctr_val (big-endian)
+   and bytes [8..15] to (ofs >> 4) (big-endian). Bytes [0..3] are left unchanged. */
+static void nca_update_bktr_ctr(unsigned char *ctr, uint32_t ctr_val, uint64_t ofs)
+{
+    ofs >>= 4;
+    for (unsigned int j = 0; j < 0x8; j++)
+    {
+        ctr[0x10 - j - 1] = (unsigned char)(ofs & 0xFF);
+        ofs >>= 8;
+    }
+    for (unsigned int j = 0; j < 4; j++)
+    {
+        ctr[0x8 - j - 1] = (unsigned char)(ctr_val & 0xFF);
+        ctr_val >>= 8;
+    }
+}
+
+/* Encrypts a BKTR section region-by-region using the subsection table's ctr_val
+   for each physical range, matching what hactool expects for decryption. */
+static void nca_encrypt_bktr_section(FILE *nca_file, nca_header_t *nca_header, uint8_t section_index, hp_settings_t *settings)
+{
+    nca_fs_header_t *fs_header = &nca_header->fs_headers[section_index];
+    uint64_t section_start = (uint64_t)nca_header->section_entries[section_index].media_start_offset * 0x200;
+    uint64_t subsec_offset_in_file = section_start + fs_header->bktr_superblock.subsection_header.offset;
+    uint64_t subsec_table_size = fs_header->bktr_superblock.subsection_header.size;
+
+    void *subsec_table_buf = malloc((size_t)subsec_table_size);
+    if (subsec_table_buf == NULL)
+        FATAL_ERROR("Failed to allocate subsection table buffer for BKTR encryption");
+
+    fseeko64(nca_file, subsec_offset_in_file, SEEK_SET);
+    if (fread(subsec_table_buf, 1, (size_t)subsec_table_size, nca_file) != subsec_table_size)
+    {
+        free(subsec_table_buf);
+        FATAL_ERROR("Failed to read subsection table for BKTR encryption");
+    }
+
+    bktr_subsection_block_t *subsec_block = (bktr_subsection_block_t *)subsec_table_buf;
+
+    unsigned char enc_key[0x10];
+    if (settings->has_title_key == 1)
+        memcpy(enc_key, settings->title_key, 0x10);
+    else
+        memcpy(enc_key, nca_header->encrypted_keys[2], 0x10);
+    aes_ctx_t *aes_ctx = new_aes_ctx(enc_key, 16, AES_MODE_CTR);
+
+    /* Init CTR upper half from section_ctr (same layout as standard CTR sections) */
+    unsigned char ctr[0x10] = {0};
+    for (unsigned int j = 0; j < 0x8; j++)
+        ctr[j] = fs_header->section_ctr[0x8 - j - 1];
+
+    const uint64_t buf_size = 0x100000; /* 1 MB */
+    unsigned char *buf = malloc((size_t)buf_size);
+    if (buf == NULL)
+    {
+        free(subsec_table_buf);
+        free_aes_ctx(aes_ctx);
+        FATAL_ERROR("Failed to allocate encryption buffer for BKTR section");
+    }
+
+    /* Walk the subsection bucket tree; encrypt each physical region with its ctr_val */
+    for (int32_t bi = 0; bi < subsec_block->num_buckets; bi++)
+    {
+        bktr_subsection_bucket_t *bucket = (bktr_subsection_bucket_t *)
+            ((uint8_t *)subsec_table_buf + BKTR_NODE_SIZE + (uint64_t)bi * BKTR_NODE_SIZE);
+
+        for (int32_t ei = 0; ei < bucket->num_entries; ei++)
+        {
+            uint64_t phys_start = bucket->entries[ei].offset;
+            uint64_t phys_end;
+
+            if (ei + 1 < bucket->num_entries)
+            {
+                phys_end = bucket->entries[ei + 1].offset;
+            }
+            else if (bi + 1 < subsec_block->num_buckets)
+            {
+                bktr_subsection_bucket_t *next_bucket = (bktr_subsection_bucket_t *)
+                    ((uint8_t *)subsec_table_buf + BKTR_NODE_SIZE + (uint64_t)(bi + 1) * BKTR_NODE_SIZE);
+                phys_end = next_bucket->entries[0].offset;
+            }
+            else
+            {
+                phys_end = (uint64_t)bucket->physical_offset_end;
+            }
+
+            uint32_t this_ctr_val = bucket->entries[ei].ctr_val;
+            printf("  BKTR encrypt subsec[%d]: phys [0x%012" PRIx64 ", 0x%012" PRIx64 ") ctr_val=%u\n",
+                   bi * (int32_t)BKTR_SUBSECTION_ENTRY_CAPACITY + ei, phys_start, phys_end, this_ctr_val);
+
+            uint64_t ofs = phys_start;
+            fseeko64(nca_file, section_start + phys_start, SEEK_SET);
+            while (ofs < phys_end)
+            {
+                uint64_t to_read = phys_end - ofs;
+                if (to_read > buf_size)
+                    to_read = buf_size;
+                if (fread(buf, 1, (size_t)to_read, nca_file) != to_read)
+                {
+                    free(buf);
+                    free(subsec_table_buf);
+                    free_aes_ctx(aes_ctx);
+                    FATAL_ERROR("Read error during BKTR section encryption");
+                }
+                nca_update_bktr_ctr(ctr, this_ctr_val, section_start + ofs);
+                aes_setiv(aes_ctx, ctr, 0x10);
+                aes_encrypt(aes_ctx, buf, buf, (size_t)to_read);
+                fseeko64(nca_file, section_start + ofs, SEEK_SET);
+                if (fwrite(buf, 1, (size_t)to_read, nca_file) != to_read)
+                {
+                    free(buf);
+                    free(subsec_table_buf);
+                    free_aes_ctx(aes_ctx);
+                    FATAL_ERROR("Write error during BKTR section encryption");
+                }
+                ofs += to_read;
+            }
+        }
+    }
+
+    free(buf);
+    free(subsec_table_buf);
+    free_aes_ctx(aes_ctx);
+}
+
 void nca_encrypt_section(FILE *nca_file, nca_header_t *nca_header, uint8_t section_index, hp_settings_t *settings)
 {
+    if (nca_header->fs_headers[section_index].crypt_type == CRYPT_BKTR)
+    {
+        nca_encrypt_bktr_section(nca_file, nca_header, section_index, settings);
+        return;
+    }
+
     uint64_t start_offset = nca_header->section_entries[section_index].media_start_offset;
     start_offset *= 0x200;
     uint64_t end_offset = nca_header->section_entries[section_index].media_end_offset;
