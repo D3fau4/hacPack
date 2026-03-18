@@ -593,6 +593,8 @@ void romfs_collect_file_layout(filepath_t *in_dirpath, romfs_file_layout_entry_t
     {
         const char *relative_path = cur_file->sum_path.char_path + root_len;
         entries[index].path = strdup(relative_path);
+        filepath_init(&entries[index].source_path);
+        filepath_copy(&entries[index].source_path, &cur_file->sum_path);
         entries[index].offset = cur_file->offset + ROMFS_FILEPARTITION_OFS;
         entries[index].size = cur_file->size;
         if (entries[index].path == NULL)

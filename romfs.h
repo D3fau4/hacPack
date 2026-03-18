@@ -86,6 +86,7 @@ typedef struct {
 
 typedef struct {
     char *path;
+    filepath_t source_path;
     uint64_t offset;
     uint64_t size;
 } romfs_file_layout_entry_t;

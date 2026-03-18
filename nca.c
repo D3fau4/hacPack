@@ -21,6 +21,7 @@
 #define NCA_PATCH_GLOBAL_INDEX_MAX_BYTES (64U * 1024U * 1024U)
 #define NCA_PATCH_GLOBAL_INDEX_MAX_PROBES 8
 #define NCA_PATCH_GLOBAL_INDEX_CANDIDATES 8
+#define NCA_PATCH_FILE_HINT_SAMPLE_SIZE 0x100
 
 typedef struct
 {
@@ -64,6 +65,8 @@ static int nca_try_read_file_exact(FILE *file, uint64_t offset, void *buffer, si
 static int nca_compare_patch_hints(const void *left, const void *right);
 static void nca_merge_patch_hints(nca_patch_hint_t *hints, uint32_t *hint_count);
 static const nca_patch_hint_t *nca_find_patch_hint(const nca_patch_hint_t *hints, uint32_t hint_count, uint64_t current_offset);
+static uint64_t nca_hash_bytes(const unsigned char *data, size_t size, uint64_t seed);
+static uint64_t nca_compute_file_hint_signature(const filepath_t *source_path, uint64_t size);
 
 static uint64_t nca_get_file_size(FILE *file)
 {
@@ -155,6 +158,81 @@ static const nca_patch_hint_t *nca_find_patch_hint(const nca_patch_hint_t *hints
     }
 
     return NULL;
+}
+
+static uint64_t nca_hash_bytes(const unsigned char *data, size_t size, uint64_t seed)
+{
+    uint64_t hash = seed;
+
+    for (size_t i = 0; i < size; i++)
+    {
+        hash ^= data[i];
+        hash *= 0x100000001B3ULL;
+        hash ^= hash >> 32;
+    }
+
+    return hash;
+}
+
+static uint64_t nca_compute_file_hint_signature(const filepath_t *source_path, uint64_t size)
+{
+    static const uint64_t fnv_offset_basis = 0xCBF29CE484222325ULL;
+    unsigned char buffer[NCA_PATCH_FILE_HINT_SAMPLE_SIZE];
+    uint64_t hash = fnv_offset_basis;
+    FILE *file = os_fopen(source_path->os_path, OS_MODE_READ);
+    uint64_t sample_offsets[3];
+    uint32_t sample_count = 0;
+
+    if (file == NULL)
+    {
+        fprintf(stderr, "Failed to open %s!\n", source_path->char_path);
+        exit(EXIT_FAILURE);
+    }
+
+    hash = nca_hash_bytes((const unsigned char *)&size, sizeof(size), hash);
+    sample_offsets[sample_count++] = 0;
+
+    if (size > NCA_PATCH_FILE_HINT_SAMPLE_SIZE)
+    {
+        uint64_t middle = 0;
+        uint64_t end = size - NCA_PATCH_FILE_HINT_SAMPLE_SIZE;
+
+        if (size > (NCA_PATCH_FILE_HINT_SAMPLE_SIZE * 2))
+        {
+            middle = (size / 2) - (NCA_PATCH_FILE_HINT_SAMPLE_SIZE / 2);
+        }
+
+        if (middle > 0 && middle != sample_offsets[0] && middle != end)
+        {
+            sample_offsets[sample_count++] = middle;
+        }
+        if (end != sample_offsets[0] && (sample_count < 2 || end != sample_offsets[1]))
+        {
+            sample_offsets[sample_count++] = end;
+        }
+    }
+
+    for (uint32_t i = 0; i < sample_count; i++)
+    {
+        uint64_t read_size = size - sample_offsets[i];
+        if (read_size > sizeof(buffer))
+        {
+            read_size = sizeof(buffer);
+        }
+
+        if (!nca_try_read_file_exact(file, sample_offsets[i], buffer, (size_t)read_size))
+        {
+            fclose(file);
+            fprintf(stderr, "Failed to read %s!\n", source_path->char_path);
+            exit(EXIT_FAILURE);
+        }
+
+        hash = nca_hash_bytes((const unsigned char *)&sample_offsets[i], sizeof(sample_offsets[i]), hash);
+        hash = nca_hash_bytes(buffer, (size_t)read_size, hash);
+    }
+
+    fclose(file);
+    return hash;
 }
 
 static uint64_t nca_hash_block(const unsigned char *block)
@@ -809,6 +887,12 @@ static nca_patch_hint_t *nca_build_patch_hints(const romfs_file_layout_entry_t *
     uint32_t hint_count = 0;
     uint32_t base_index = 0;
     uint32_t current_index = 0;
+    bool *base_matched = NULL;
+    bool *current_matched = NULL;
+    uint64_t *base_signatures = NULL;
+    uint64_t *current_signatures = NULL;
+    bool *base_signature_valid = NULL;
+    bool *current_signature_valid = NULL;
 
     *out_hint_count = 0;
     if (base_files == NULL || current_files == NULL || base_file_count == 0 || current_file_count == 0)
@@ -820,6 +904,26 @@ static nca_patch_hint_t *nca_build_patch_hints(const romfs_file_layout_entry_t *
     if (hints == NULL)
     {
         FATAL_ERROR("Failed to allocate RomFS patch hints");
+    }
+
+    base_matched = calloc(base_file_count, sizeof(*base_matched));
+    current_matched = calloc(current_file_count, sizeof(*current_matched));
+    base_signatures = calloc(base_file_count, sizeof(*base_signatures));
+    current_signatures = calloc(current_file_count, sizeof(*current_signatures));
+    base_signature_valid = calloc(base_file_count, sizeof(*base_signature_valid));
+    current_signature_valid = calloc(current_file_count, sizeof(*current_signature_valid));
+    if (base_matched == NULL || current_matched == NULL ||
+        base_signatures == NULL || current_signatures == NULL ||
+        base_signature_valid == NULL || current_signature_valid == NULL)
+    {
+        free(hints);
+        free(base_matched);
+        free(current_matched);
+        free(base_signatures);
+        free(current_signatures);
+        free(base_signature_valid);
+        free(current_signature_valid);
+        FATAL_ERROR("Failed to allocate RomFS patch hint metadata");
     }
 
     while (base_index < base_file_count && current_index < current_file_count)
@@ -847,20 +951,122 @@ static nca_patch_hint_t *nca_build_patch_hints(const romfs_file_layout_entry_t *
             hints[hint_count].current_offset = current_section_offset + current_files[current_index].offset;
             hints[hint_count].size = shared_size;
             hint_count++;
+            base_matched[base_index] = true;
+            current_matched[current_index] = true;
         }
 
         base_index++;
         current_index++;
     }
 
+    for (uint32_t current_file_index = 0; current_file_index < current_file_count; current_file_index++)
+    {
+        uint32_t matched_base_index = UINT32_MAX;
+        uint32_t base_candidate_count = 0;
+        uint32_t current_candidate_count = 0;
+
+        if (current_matched[current_file_index])
+        {
+            continue;
+        }
+
+        if (!current_signature_valid[current_file_index])
+        {
+            current_signatures[current_file_index] = nca_compute_file_hint_signature(&current_files[current_file_index].source_path, current_files[current_file_index].size);
+            current_signature_valid[current_file_index] = true;
+        }
+
+        for (uint32_t other_current_index = 0; other_current_index < current_file_count; other_current_index++)
+        {
+            if (current_matched[other_current_index] || current_files[other_current_index].size != current_files[current_file_index].size)
+            {
+                continue;
+            }
+
+            if (!current_signature_valid[other_current_index])
+            {
+                current_signatures[other_current_index] = nca_compute_file_hint_signature(&current_files[other_current_index].source_path, current_files[other_current_index].size);
+                current_signature_valid[other_current_index] = true;
+            }
+
+            if (current_signatures[other_current_index] == current_signatures[current_file_index])
+            {
+                current_candidate_count++;
+                if (current_candidate_count > 1)
+                {
+                    break;
+                }
+            }
+        }
+
+        if (current_candidate_count != 1)
+        {
+            continue;
+        }
+
+        for (uint32_t base_file_index = 0; base_file_index < base_file_count; base_file_index++)
+        {
+            if (base_matched[base_file_index] || base_files[base_file_index].size != current_files[current_file_index].size)
+            {
+                continue;
+            }
+
+            if (!base_signature_valid[base_file_index])
+            {
+                base_signatures[base_file_index] = nca_compute_file_hint_signature(&base_files[base_file_index].source_path, base_files[base_file_index].size);
+                base_signature_valid[base_file_index] = true;
+            }
+
+            if (base_signatures[base_file_index] == current_signatures[current_file_index])
+            {
+                matched_base_index = base_file_index;
+                base_candidate_count++;
+                if (base_candidate_count > 1)
+                {
+                    break;
+                }
+            }
+        }
+
+        if (base_candidate_count != 1)
+        {
+            continue;
+        }
+
+        {
+            uint64_t shared_size = current_files[current_file_index].size - (current_files[current_file_index].size % NCA_PATCH_BLOCK_SIZE);
+            if (shared_size >= NCA_PATCH_SAME_OFFSET_REUSE_MIN_SIZE)
+            {
+                hints[hint_count].base_offset = base_section_offset + base_files[matched_base_index].offset;
+                hints[hint_count].current_offset = current_section_offset + current_files[current_file_index].offset;
+                hints[hint_count].size = shared_size;
+                hint_count++;
+                base_matched[matched_base_index] = true;
+                current_matched[current_file_index] = true;
+            }
+        }
+    }
+
     if (hint_count == 0)
     {
         free(hints);
+        free(base_matched);
+        free(current_matched);
+        free(base_signatures);
+        free(current_signatures);
+        free(base_signature_valid);
+        free(current_signature_valid);
         return NULL;
     }
 
     qsort(hints, hint_count, sizeof(*hints), nca_compare_patch_hints);
     nca_merge_patch_hints(hints, &hint_count);
+    free(base_matched);
+    free(current_matched);
+    free(base_signatures);
+    free(current_signatures);
+    free(base_signature_valid);
+    free(current_signature_valid);
     *out_hint_count = hint_count;
     return hints;
 }
