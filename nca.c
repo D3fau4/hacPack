@@ -11,6 +11,442 @@
 #include "ticket.h"
 #include "rsa.h"
 
+typedef struct
+{
+    bktr_relocation_segment_t *segments;
+    uint32_t segment_count;
+    uint64_t patch_data_size;
+} nca_patch_layout_t;
+
+static uint64_t nca_get_file_size(FILE *file)
+{
+    uint64_t current_offset = ftello64(file);
+    fseeko64(file, 0, SEEK_END);
+    uint64_t size = (uint64_t)ftello64(file);
+    fseeko64(file, current_offset, SEEK_SET);
+    return size;
+}
+
+static uint32_t nca_get_section_generation(const nca_fs_header_t *fs_header)
+{
+    uint32_t generation = 0;
+    memcpy(&generation, fs_header->section_ctr, sizeof(generation));
+    return generation;
+}
+
+static void nca_append_patch_segment(nca_patch_layout_t *layout, uint32_t *capacity, uint64_t virtual_offset, uint64_t size, uint32_t is_patch)
+{
+    if (size == 0)
+    {
+        return;
+    }
+
+    if (layout->segment_count == *capacity)
+    {
+        uint32_t new_capacity = (*capacity == 0) ? 16 : (*capacity * 2);
+        bktr_relocation_segment_t *new_segments = realloc(layout->segments, sizeof(*layout->segments) * new_capacity);
+        if (new_segments == NULL)
+        {
+            FATAL_ERROR("Failed to allocate BKTR relocation segments");
+        }
+        layout->segments = new_segments;
+        *capacity = new_capacity;
+    }
+
+    layout->segments[layout->segment_count].virtual_offset = virtual_offset;
+    layout->segments[layout->segment_count].size = size;
+    layout->segments[layout->segment_count].physical_offset = is_patch ? layout->patch_data_size : virtual_offset;
+    layout->segments[layout->segment_count].is_patch = is_patch;
+
+    if (is_patch)
+    {
+        layout->patch_data_size += size;
+    }
+
+    layout->segment_count++;
+}
+
+static void nca_build_full_patch_layout(nca_patch_layout_t *layout, uint64_t size)
+{
+    uint32_t capacity = 0;
+
+    free(layout->segments);
+    memset(layout, 0, sizeof(*layout));
+    nca_append_patch_segment(layout, &capacity, 0, size, 1);
+}
+
+static void nca_build_patch_layout(FILE *base_file, uint64_t base_size, FILE *current_file, uint64_t current_size, nca_patch_layout_t *layout)
+{
+    const uint64_t block_size = 0x10;
+    const uint64_t compare_buffer_size = 0x100000;
+    uint32_t capacity = 0;
+
+    free(layout->segments);
+    memset(layout, 0, sizeof(*layout));
+
+    if (base_file == NULL || base_size == 0)
+    {
+        nca_build_full_patch_layout(layout, current_size);
+        return;
+    }
+
+    unsigned char *current_buffer = malloc(compare_buffer_size);
+    unsigned char *base_buffer = malloc(compare_buffer_size);
+    if (current_buffer == NULL || base_buffer == NULL)
+    {
+        free(current_buffer);
+        free(base_buffer);
+        FATAL_ERROR("Failed to allocate BKTR compare buffer");
+    }
+
+    fseeko64(base_file, 0, SEEK_SET);
+    fseeko64(current_file, 0, SEEK_SET);
+
+    uint64_t offset = 0;
+    uint64_t segment_start = 0;
+    int has_segment = 0;
+    int current_is_patch = 1;
+
+    while (offset < current_size)
+    {
+        uint64_t read_size = compare_buffer_size;
+        if (offset + read_size > current_size)
+        {
+            read_size = current_size - offset;
+        }
+
+        if (fread(current_buffer, 1, read_size, current_file) != read_size)
+        {
+            free(current_buffer);
+            free(base_buffer);
+            FATAL_ERROR("Failed to read current RomFS section");
+        }
+
+        uint64_t base_read_size = 0;
+        if (offset < base_size)
+        {
+            base_read_size = read_size;
+            if (offset + base_read_size > base_size)
+            {
+                base_read_size = base_size - offset;
+            }
+
+            if (fread(base_buffer, 1, base_read_size, base_file) != base_read_size)
+            {
+                free(current_buffer);
+                free(base_buffer);
+                FATAL_ERROR("Failed to read base RomFS section");
+            }
+        }
+
+        for (uint64_t i = 0; i < read_size; i += block_size)
+        {
+            uint64_t global_offset = offset + i;
+            int is_patch = 1;
+
+            if (global_offset + block_size <= base_size &&
+                i + block_size <= base_read_size &&
+                memcmp(current_buffer + i, base_buffer + i, block_size) == 0)
+            {
+                is_patch = 0;
+            }
+
+            if (!has_segment)
+            {
+                has_segment = 1;
+                current_is_patch = is_patch;
+                segment_start = global_offset;
+            }
+            else if (current_is_patch != is_patch)
+            {
+                nca_append_patch_segment(layout, &capacity, segment_start, global_offset - segment_start, (uint32_t)current_is_patch);
+                current_is_patch = is_patch;
+                segment_start = global_offset;
+            }
+        }
+
+        offset += read_size;
+    }
+
+    if (has_segment)
+    {
+        nca_append_patch_segment(layout, &capacity, segment_start, current_size - segment_start, (uint32_t)current_is_patch);
+    }
+
+    free(current_buffer);
+    free(base_buffer);
+
+    if (layout->segment_count == 0 || layout->segment_count > BKTR_RELOCATION_ENTRY_CAPACITY)
+    {
+        printf("BKTR diff too fragmented, falling back to full replacement patch data\n");
+        nca_build_full_patch_layout(layout, current_size);
+    }
+}
+
+static void nca_copy_file_range(FILE *dst, uint64_t dst_offset, FILE *src, uint64_t src_offset, uint64_t size)
+{
+    uint64_t read_size = 0x400000;
+    unsigned char *buffer = malloc(read_size);
+    if (buffer == NULL)
+    {
+        FATAL_ERROR("Failed to allocate file copy buffer");
+    }
+
+    fseeko64(dst, dst_offset, SEEK_SET);
+    fseeko64(src, src_offset, SEEK_SET);
+
+    uint64_t copied = 0;
+    while (copied < size)
+    {
+        if (copied + read_size > size)
+        {
+            read_size = size - copied;
+        }
+
+        if (fread(buffer, 1, read_size, src) != read_size)
+        {
+            free(buffer);
+            FATAL_ERROR("Failed to read source range");
+        }
+
+        if (fwrite(buffer, 1, read_size, dst) != read_size)
+        {
+            free(buffer);
+            FATAL_ERROR("Failed to write destination range");
+        }
+
+        copied += read_size;
+    }
+
+    free(buffer);
+}
+
+static uint64_t nca_build_romfs_section_data(hp_settings_t *settings, filepath_t *romfs_dir, const char *prefix, filepath_t *out_section_path, romfs_superblock_t *out_superblock)
+{
+    filepath_t ivfc_lvls_path[6];
+
+    memset(out_superblock, 0, sizeof(*out_superblock));
+
+    filepath_init(out_section_path);
+    filepath_copy(out_section_path, &settings->temp_dir);
+    filepath_append(out_section_path, "%s_section", prefix);
+
+    for (int i = 0; i < 6; i++)
+    {
+        filepath_init(&ivfc_lvls_path[i]);
+        filepath_copy(&ivfc_lvls_path[i], &settings->temp_dir);
+        filepath_append(&ivfc_lvls_path[i], "%s_ivfc_lvl%i", prefix, i + 1);
+    }
+
+    printf("\n===> Building RomFS\n");
+    romfs_build(romfs_dir, &ivfc_lvls_path[5], &out_superblock->ivfc_header.level_headers[5].hash_data_size);
+    out_superblock->ivfc_header.level_headers[5].block_size = 0x0E;
+
+    printf("\n===> Creating IVFC levels\n");
+    for (int i = 4; i >= 0; i--)
+    {
+        printf("Writing %s\n", ivfc_lvls_path[i].char_path);
+        ivfc_create_level(&ivfc_lvls_path[i], &ivfc_lvls_path[i + 1], &out_superblock->ivfc_header.level_headers[i].hash_data_size);
+        out_superblock->ivfc_header.level_headers[i].block_size = 0x0E;
+    }
+
+    out_superblock->ivfc_header.level_headers[0].logical_offset = 0;
+    for (int i = 1; i <= 5; i++)
+    {
+        out_superblock->ivfc_header.level_headers[i].logical_offset =
+            out_superblock->ivfc_header.level_headers[i - 1].logical_offset +
+            out_superblock->ivfc_header.level_headers[i - 1].hash_data_size;
+    }
+
+    out_superblock->ivfc_header.magic = MAGIC_IVFC;
+    out_superblock->ivfc_header.id = 0x20000;
+    out_superblock->ivfc_header.master_hash_size = 0x20;
+    out_superblock->ivfc_header.num_levels = 0x7;
+
+    printf("\n===> Calculating Hashes:\n");
+    printf("Calculating Master hash\n");
+    ivfc_calculate_master_hash(&ivfc_lvls_path[0], out_superblock->ivfc_header.master_hash);
+
+    FILE *section_file = os_fopen(out_section_path->os_path, OS_MODE_WRITE_EDIT);
+    if (section_file == NULL)
+    {
+        fprintf(stderr, "Failed to create %s!\n", out_section_path->char_path);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("\n===> Writing IVFC levels\n");
+    for (int i = 0; i < 6; i++)
+    {
+        printf("Writing %s to %s\n", ivfc_lvls_path[i].char_path, out_section_path->char_path);
+        nca_write_file(section_file, &ivfc_lvls_path[i]);
+    }
+
+    nca_write_padding(section_file);
+
+    uint64_t section_size = (uint64_t)ftello64(section_file);
+    fclose(section_file);
+
+    return section_size;
+}
+
+static void nca_prepare_romfs_fs_header(nca_fs_header_t *fs_header, uint8_t crypt_type)
+{
+    fs_header->fs_type = FS_TYPE_ROMFS;
+    fs_header->hash_type = HASH_TYPE_ROMFS;
+    fs_header->version = 0x2;
+    fs_header->crypt_type = crypt_type;
+    fs_header->romfs_superblock.ivfc_header.magic = MAGIC_IVFC;
+    fs_header->romfs_superblock.ivfc_header.id = 0x20000;
+    fs_header->romfs_superblock.ivfc_header.master_hash_size = 0x20;
+    fs_header->romfs_superblock.ivfc_header.num_levels = 0x7;
+}
+
+static uint64_t nca_build_patch_romfs_section(filepath_t *base_section_path, filepath_t *current_section_path, filepath_t *out_section_path, nca_fs_header_t *fs_header)
+{
+    FILE *current_section = os_fopen(current_section_path->os_path, OS_MODE_READ);
+    if (current_section == NULL)
+    {
+        fprintf(stderr, "Failed to open %s!\n", current_section_path->char_path);
+        exit(EXIT_FAILURE);
+    }
+
+    FILE *base_section = NULL;
+    if (base_section_path != NULL)
+    {
+        base_section = os_fopen(base_section_path->os_path, OS_MODE_READ);
+        if (base_section == NULL)
+        {
+            fprintf(stderr, "Failed to open %s!\n", base_section_path->char_path);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    const uint64_t current_size = nca_get_file_size(current_section);
+    const uint64_t base_size = (base_section != NULL) ? nca_get_file_size(base_section) : 0;
+
+    nca_patch_layout_t layout;
+    memset(&layout, 0, sizeof(layout));
+    nca_build_patch_layout(base_section, base_size, current_section, current_size, &layout);
+
+    FILE *patch_section = os_fopen(out_section_path->os_path, OS_MODE_WRITE_EDIT);
+    if (patch_section == NULL)
+    {
+        fprintf(stderr, "Failed to create %s!\n", out_section_path->char_path);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("\n===> Writing BKTR patch data\n");
+    for (uint32_t i = 0; i < layout.segment_count; i++)
+    {
+        if (layout.segments[i].is_patch == 0)
+        {
+            continue;
+        }
+
+        printf("Writing patch range 0x%012" PRIx64 " size 0x%012" PRIx64 "\n",
+               layout.segments[i].virtual_offset,
+               layout.segments[i].size);
+        nca_copy_file_range(
+            patch_section,
+            layout.segments[i].physical_offset,
+            current_section,
+            layout.segments[i].virtual_offset,
+            layout.segments[i].size);
+    }
+
+    nca_write_padding(patch_section);
+
+    const uint64_t relocation_offset = (uint64_t)ftello64(patch_section);
+    unsigned char *relocation_table = calloc(1, BKTR_RELOCATION_TABLE_SIZE);
+    unsigned char *subsection_table = calloc(1, BKTR_SUBSECTION_TABLE_SIZE);
+    if (relocation_table == NULL || subsection_table == NULL)
+    {
+        free(relocation_table);
+        free(subsection_table);
+        FATAL_ERROR("Failed to allocate BKTR tables");
+    }
+
+    bktr_build_relocation_table(relocation_table, current_size, layout.segments, layout.segment_count);
+    if (fwrite(relocation_table, 1, BKTR_RELOCATION_TABLE_SIZE, patch_section) != BKTR_RELOCATION_TABLE_SIZE)
+    {
+        free(relocation_table);
+        free(subsection_table);
+        FATAL_ERROR("Failed to write BKTR relocation table");
+    }
+
+    const uint64_t subsection_offset = (uint64_t)ftello64(patch_section);
+    bktr_build_subsection_table(subsection_table, subsection_offset, relocation_offset, nca_get_section_generation(fs_header));
+    if (fwrite(subsection_table, 1, BKTR_SUBSECTION_TABLE_SIZE, patch_section) != BKTR_SUBSECTION_TABLE_SIZE)
+    {
+        free(relocation_table);
+        free(subsection_table);
+        FATAL_ERROR("Failed to write BKTR subsection table");
+    }
+
+    const uint64_t section_size = (uint64_t)ftello64(patch_section);
+
+    free(relocation_table);
+    free(subsection_table);
+    free(layout.segments);
+
+    fclose(patch_section);
+    fclose(current_section);
+    if (base_section != NULL)
+    {
+        fclose(base_section);
+    }
+
+    fs_header->crypt_type = CRYPT_BKTR;
+    fs_header->bktr_superblock.relocation_header.offset = relocation_offset;
+    fs_header->bktr_superblock.relocation_header.size = BKTR_RELOCATION_TABLE_SIZE;
+    fs_header->bktr_superblock.relocation_header.magic = MAGIC_BKTR;
+    fs_header->bktr_superblock.relocation_header.version = BKTR_VERSION;
+    fs_header->bktr_superblock.relocation_header.num_entries = layout.segment_count;
+    fs_header->bktr_superblock.relocation_header.reserved = 0;
+    fs_header->bktr_superblock.subsection_header.offset = subsection_offset;
+    fs_header->bktr_superblock.subsection_header.size = BKTR_SUBSECTION_TABLE_SIZE;
+    fs_header->bktr_superblock.subsection_header.magic = MAGIC_BKTR;
+    fs_header->bktr_superblock.subsection_header.version = BKTR_VERSION;
+    fs_header->bktr_superblock.subsection_header.num_entries = 1;
+    fs_header->bktr_superblock.subsection_header.reserved = 0;
+
+    return section_size;
+}
+
+static uint64_t nca_prepare_romfs_section(hp_settings_t *settings, filepath_t *romfs_dir, filepath_t *base_romfs_dir, const char *prefix, filepath_t *out_section_path, nca_fs_header_t *fs_header)
+{
+    filepath_t current_section_path;
+    filepath_t patch_section_path;
+    filepath_t base_section_path;
+    filepath_t *base_section_ptr = NULL;
+    romfs_superblock_t base_superblock;
+
+    uint64_t current_size = nca_build_romfs_section_data(settings, romfs_dir, prefix, &current_section_path, &fs_header->romfs_superblock);
+    nca_prepare_romfs_fs_header(fs_header, settings->plaintext ? CRYPT_NONE : CRYPT_CTR);
+
+    if (!settings->create_patch)
+    {
+        filepath_copy(out_section_path, &current_section_path);
+        return current_size;
+    }
+
+    if (base_romfs_dir != NULL && base_romfs_dir->valid == VALIDITY_VALID)
+    {
+        char base_prefix[MAX_PATH];
+        snprintf(base_prefix, sizeof(base_prefix), "%s_base", prefix);
+        memset(&base_superblock, 0, sizeof(base_superblock));
+        nca_build_romfs_section_data(settings, base_romfs_dir, base_prefix, &base_section_path, &base_superblock);
+        base_section_ptr = &base_section_path;
+    }
+
+    filepath_init(&patch_section_path);
+    filepath_copy(&patch_section_path, &settings->temp_dir);
+    filepath_append(&patch_section_path, "%s_patch_section", prefix);
+
+    filepath_copy(out_section_path, &patch_section_path);
+    return nca_build_patch_romfs_section(base_section_ptr, &current_section_path, out_section_path, fs_header);
+}
+
 void nca_create_romfs_type(hp_settings_t *settings, char *nca_type)
 {
     printf("----> Creating %s NCA:\n", nca_type);
@@ -38,43 +474,11 @@ void nca_create_romfs_type(hp_settings_t *settings, char *nca_type)
 
     printf("\n---> Creating Section 0:");
 
-    // Set IVFC levels temp filepaths
-    filepath_t ivfc_lvls_path[6];
-    for (int a = 0; a < 6; a++)
-    {
-        filepath_init(&ivfc_lvls_path[a]);
-        filepath_copy(&ivfc_lvls_path[a], &settings->temp_dir);
-        filepath_append(&ivfc_lvls_path[a], "%s_sec0_ivfc_lvl%i", nca_type, a + 1);
-    }
+    filepath_t section0_path;
+    filepath_init(&section0_path);
+    nca_prepare_romfs_section(settings, &settings->romfs_dir, &settings->base_romfs_dir, nca_type, &section0_path, &nca_header.fs_headers[0]);
 
-    //Build RomFS
-    printf("\n===> Building RomFS\n");
-    romfs_build(&settings->romfs_dir, &ivfc_lvls_path[5], &nca_header.fs_headers[0].romfs_superblock.ivfc_header.level_headers[5].hash_data_size);
-    nca_header.fs_headers[0].romfs_superblock.ivfc_header.level_headers[5].block_size = 0x0E; // 0x4000
-
-    // Create IVFC levels
-    printf("\n===> Creating IVFC levels\n");
-    for (int b = 4; b >= 0; b--)
-    {
-        printf("Writing %s\n", ivfc_lvls_path[b].char_path);
-        ivfc_create_level(&ivfc_lvls_path[b], &ivfc_lvls_path[b + 1], &nca_header.fs_headers[0].romfs_superblock.ivfc_header.level_headers[b].hash_data_size);
-        nca_header.fs_headers[0].romfs_superblock.ivfc_header.level_headers[b].block_size = 0x0E; // 0x4000
-    }
-
-    // Set IVFC levels logical offset
-    nca_header.fs_headers[0].romfs_superblock.ivfc_header.level_headers[0].logical_offset = 0;
-    for (int i = 1; i <= 5; i++)
-        nca_header.fs_headers[0].romfs_superblock.ivfc_header.level_headers[i].logical_offset = nca_header.fs_headers[0].romfs_superblock.ivfc_header.level_headers[i - 1].logical_offset + nca_header.fs_headers[0].romfs_superblock.ivfc_header.level_headers[i - 1].hash_data_size;
-
-    // Write IVFC levels
-    printf("\n===> Writing IVFC levels\n");
-    for (int c = 0; c < 6; c++)
-    {
-        printf("Writing %s to %s\n", ivfc_lvls_path[c].char_path, romfs_nca_path.char_path);
-        nca_write_file(romfs_nca_file, &ivfc_lvls_path[c]);
-    }
-
-    // Write Padding if required
+    nca_write_file(romfs_nca_file, &section0_path);
     nca_write_padding(romfs_nca_file);
 
     // Common values
@@ -90,21 +494,8 @@ void nca_create_romfs_type(hp_settings_t *settings, char *nca_type)
     nca_header.section_entries[0].media_end_offset = (uint32_t)(ftello64(romfs_nca_file) / 0x200); // Section end offset / 200
     nca_header.section_entries[0]._0x8[0] = 0x1;                                                   // Always 1
 
-    nca_header.fs_headers[0].hash_type = HASH_TYPE_ROMFS;
-    nca_header.fs_headers[0].version = 0x2; // Always 2
-    nca_header.fs_headers[0].romfs_superblock.ivfc_header.magic = MAGIC_IVFC;
-    nca_header.fs_headers[0].romfs_superblock.ivfc_header.id = 0x20000; //Always 0x20000
-    nca_header.fs_headers[0].romfs_superblock.ivfc_header.master_hash_size = 0x20;
-    nca_header.fs_headers[0].romfs_superblock.ivfc_header.num_levels = 0x7;
-    if (settings->plaintext == 0)
-        nca_header.fs_headers[0].crypt_type = CRYPT_CTR;
-    else
-        nca_header.fs_headers[0].crypt_type = CRYPT_NONE;
-
-    // Calculate master hash and section hash
+    // Calculate section hash
     printf("\n===> Calculating Hashes:\n");
-    printf("Calculating Master hash\n");
-    ivfc_calculate_master_hash(&ivfc_lvls_path[0], nca_header.fs_headers[0].romfs_superblock.ivfc_header.master_hash);
     printf("Calculating Section hash\n");
     nca_calculate_section_hash(&nca_header.fs_headers[0], nca_header.section_hashes[0]);
 
@@ -279,43 +670,11 @@ void nca_create_program(hp_settings_t *settings)
 
         printf("\n---> Creating Section 1:");
 
-        // Set IVFC levels temp filepaths
-        filepath_t ivfc_lvls_path[6];
-        for (int a = 0; a < 6; a++)
-        {
-            filepath_init(&ivfc_lvls_path[a]);
-            filepath_copy(&ivfc_lvls_path[a], &settings->temp_dir);
-            filepath_append(&ivfc_lvls_path[a], "program_sec1_ivfc_lvl%i", a + 1);
-        }
+        filepath_t section1_path;
+        filepath_init(&section1_path);
+        nca_prepare_romfs_section(settings, &settings->romfs_dir, &settings->base_romfs_dir, "program_sec1", &section1_path, &nca_header.fs_headers[1]);
 
-        //Build RomFS
-        printf("\n===> Building RomFS\n");
-        romfs_build(&settings->romfs_dir, &ivfc_lvls_path[5], &nca_header.fs_headers[1].romfs_superblock.ivfc_header.level_headers[5].hash_data_size);
-        nca_header.fs_headers[1].romfs_superblock.ivfc_header.level_headers[5].block_size = 0x0E; // 0x4000
-
-        // Create IVFC levels
-        printf("\n===> Creating IVFC levels\n");
-        for (int b = 4; b >= 0; b--)
-        {
-            printf("Writing %s\n", ivfc_lvls_path[b].char_path);
-            ivfc_create_level(&ivfc_lvls_path[b], &ivfc_lvls_path[b + 1], &nca_header.fs_headers[1].romfs_superblock.ivfc_header.level_headers[b].hash_data_size);
-            nca_header.fs_headers[1].romfs_superblock.ivfc_header.level_headers[b].block_size = 0x0E; // 0x4000
-        }
-
-        // Set IVFC levels logical offset
-        nca_header.fs_headers[1].romfs_superblock.ivfc_header.level_headers[0].logical_offset = 0;
-        for (int i = 1; i <= 5; i++)
-            nca_header.fs_headers[1].romfs_superblock.ivfc_header.level_headers[i].logical_offset = nca_header.fs_headers[1].romfs_superblock.ivfc_header.level_headers[i - 1].logical_offset + nca_header.fs_headers[1].romfs_superblock.ivfc_header.level_headers[i - 1].hash_data_size;
-
-        // Write IVFC levels
-        printf("\n===> Writing IVFC levels\n");
-        for (int c = 0; c < 6; c++)
-        {
-            printf("Writing %s to %s\n", ivfc_lvls_path[c].char_path, program_nca_path.char_path);
-            nca_write_file(program_nca_file, &ivfc_lvls_path[c]);
-        }
-
-        // Write Padding if required
+        nca_write_file(program_nca_file, &section1_path);
         nca_write_padding(program_nca_file);
 
         // Set header values
@@ -323,21 +682,8 @@ void nca_create_program(hp_settings_t *settings)
         nca_header.section_entries[1].media_end_offset = (uint32_t)(ftello64(program_nca_file) / 0x200);
         nca_header.section_entries[1]._0x8[0] = 0x1; // Always 1
 
-        nca_header.fs_headers[1].hash_type = HASH_TYPE_ROMFS;
-        nca_header.fs_headers[1].version = 0x2; // Always 2
-        nca_header.fs_headers[1].romfs_superblock.ivfc_header.magic = MAGIC_IVFC;
-        nca_header.fs_headers[1].romfs_superblock.ivfc_header.id = 0x20000; //Always 0x20000
-        nca_header.fs_headers[1].romfs_superblock.ivfc_header.master_hash_size = 0x20;
-        nca_header.fs_headers[1].romfs_superblock.ivfc_header.num_levels = 0x7;
-        if (settings->plaintext == 0)
-            nca_header.fs_headers[1].crypt_type = CRYPT_CTR;
-        else
-            nca_header.fs_headers[1].crypt_type = CRYPT_NONE;
-
-        // Calculate master hash and section hash
+        // Calculate section hash
         printf("\n===> Calculating Hashes:\n");
-        printf("Calculating Master hash\n");
-        ivfc_calculate_master_hash(&ivfc_lvls_path[0], nca_header.fs_headers[1].romfs_superblock.ivfc_header.master_hash);
         printf("Calculating Section hash\n");
         nca_calculate_section_hash(&nca_header.fs_headers[1], nca_header.section_hashes[1]);
     }

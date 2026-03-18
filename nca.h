@@ -4,6 +4,7 @@
 #include "types.h"
 #include "settings.h"
 #include "aes.h"
+#include "bktr.h"
 #include "pfs0.h"
 #include "romfs.h"
 #include "ivfc.h"
@@ -51,6 +52,13 @@ typedef struct
     union { /* FS-specific superblock. Size = 0x138. */
         pfs0_superblock_t pfs0_superblock;
         romfs_superblock_t romfs_superblock;
+        struct
+        {
+            ivfc_hdr_t ivfc_header;
+            uint8_t _0xE0[0x18];
+            bktr_header_t relocation_header;
+            bktr_header_t subsection_header;
+        } bktr_superblock;
     };
     uint8_t section_ctr[0x8];
     uint8_t _0x148[0xB8]; /* Padding. */

@@ -33,6 +33,8 @@ static void usage(void)
             "--backupdir              Set backup directory filepath, default filepath is ." OS_PATH_SEPARATOR "hacbpack_backup" OS_PATH_SEPARATOR "\n"
             "--keygeneration          Set keygeneration for encrypting key area, default keygeneration is 1\n"
             "--plaintext              Skip encrypting sections and set section header block crypto type to plaintext\n"
+            "--patch                  Build RomFS sections as BKTR patch sections\n"
+            "--baseromfsdir           Set base RomFS directory used to build delta/patch data\n"
             "--sdkversion             Set SDK version in hex, default SDK version is 000C1100\n"
             "--keyareakey             Set key area key 2 in hex with 16 bytes length\n"
             "--ncasig                 Set nca signature type [zero, static, random]. Default is zero\n"
@@ -83,6 +85,7 @@ int main(int argc, char **argv)
     filepath_init(&settings.out_dir);
     filepath_init(&settings.exefs_dir);
     filepath_init(&settings.romfs_dir);
+    filepath_init(&settings.base_romfs_dir);
     filepath_init(&settings.logo_dir);
     filepath_init(&settings.programnca);
     filepath_init(&settings.controlnca);
@@ -159,6 +162,8 @@ int main(int argc, char **argv)
                 {"ncasig", 1, NULL, 30},
                 {"ncasig2privatekey", 1, NULL, 31},
                 {"ncasig2modulus", 1, NULL, 32},
+                {"patch", 0, NULL, 33},
+                {"baseromfsdir", 1, NULL, 34},
                 {NULL, 0, NULL, 0},
             };
 
@@ -344,12 +349,23 @@ int main(int argc, char **argv)
         case 32:
             filepath_set(&settings.nca_sig2_modulus, optarg);
             break;
+        case 33:
+            settings.create_patch = 1;
+            break;
+        case 34:
+            filepath_set(&settings.base_romfs_dir, optarg);
+            break;
         default:
             usage();
         }
     }
 
     printf("----> Preparing:\n");
+
+    if (settings.base_romfs_dir.valid == VALIDITY_VALID)
+    {
+        settings.create_patch = 1;
+    }
 
     // Try to populate default keyfile.
     FILE *keyfile = NULL;
@@ -478,6 +494,26 @@ int main(int argc, char **argv)
 
     if (settings.file_type == FILE_TYPE_NCA)
     {
+        if (settings.create_patch && settings.plaintext)
+        {
+            fprintf(stderr, "Error: --patch is not compatible with --plaintext\n");
+            return EXIT_FAILURE;
+        }
+
+        if (settings.create_patch && settings.nca_type == NCA_TYPE_META)
+        {
+            fprintf(stderr, "Error: --patch is not supported for metadata nca\n");
+            return EXIT_FAILURE;
+        }
+
+        if (settings.create_patch &&
+            settings.nca_type == NCA_TYPE_PROGRAM &&
+            settings.romfs_dir.valid == VALIDITY_INVALID)
+        {
+            fprintf(stderr, "Error: --patch requires --romfsdir for program nca\n");
+            return EXIT_FAILURE;
+        }
+
         // Remove existing temp directory and create a new one
         printf("Removing existing temp directory\n");
         filepath_remove_directory(&settings.temp_dir);

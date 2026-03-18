@@ -97,6 +97,7 @@ typedef struct
     filepath_t out_dir;
     filepath_t exefs_dir;
     filepath_t romfs_dir;
+    filepath_t base_romfs_dir;
     filepath_t logo_dir;
     filepath_t programnca;
     filepath_t controlnca;
@@ -113,6 +114,7 @@ typedef struct
     filepath_t nca_sig2_private_key;
     filepath_t nca_sig2_modulus;
     uint8_t plaintext;
+    uint8_t create_patch;
     uint8_t digest[0x20];
     uint32_t title_version;
     uint8_t has_title_key;

@@ -14,10 +14,12 @@ all:
 .c.o:
 	$(CC) $(INCLUDE) -c $(CFLAGS) -o $@ $<
 
-hacpack: sha.o aes.o extkeys.o pki.o utils.o main.o filepath.o ConvertUTF.o nca.o romfs.o pfs0.o ivfc.o nacp.o npdm.o cnmt.o ticket.o rsa.o
+hacpack: sha.o aes.o bktr.o extkeys.o pki.o utils.o main.o filepath.o ConvertUTF.o nca.o romfs.o pfs0.o ivfc.o nacp.o npdm.o cnmt.o ticket.o rsa.o
 	$(CC) -o $@ $^ $(LDFLAGS) -L $(LIBDIR)
 
 aes.o: aes.h types.h
+
+bktr.o: bktr.h utils.h
 
 extkeys.o: extkeys.h types.h settings.h
 
