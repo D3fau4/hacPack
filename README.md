@@ -42,6 +42,7 @@ NCA general options:
 --keygeneration          Set keygeneration for encrypting key area, default keygeneration is 1  
 --plaintext              Skip encrypting sections and set section header block crypto type to plaintext  
 --sdkversion             Set SDK version in hex, default SDK version is 000C1100  
+--profile                Print per-phase timings for patch generation  
 --keyareakey             Set key area key 2 in hex with 16 bytes length  
 --ncasig                 Set nca signature type [zero, static, random]. Default is zero  
 --disttype               Set nca distribution type [download, gamecard]. Default is download  
@@ -78,6 +79,11 @@ Metadata NCA options:
 NSP options:  
 --ncadir                 Set input nca directory path  
 ```
+
+### Performance notes
+
+- `--patch` now supports `--profile`, which prints timings for the main patch-generation phases.
+- On WSL, inputs under `/mnt/...` can be much slower for large RomFS trees because patch generation performs many metadata and random-read operations. For large workloads, prefer staging `--romfsdir` and `--baseromfsdir` on the Linux filesystem instead of `/mnt/c`.
 
 ### GUI
 

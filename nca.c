@@ -23,6 +23,12 @@
 #define NCA_PATCH_GLOBAL_INDEX_CANDIDATES 8
 #define NCA_PATCH_FILE_HINT_SAMPLE_SIZE 0x100
 #define NCA_PATCH_INDEX_READ_CHUNK (4U * 1024U * 1024U)
+#define NCA_PATCH_SKIP_SEARCH_THRESHOLD_SMALL 0x40000
+#define NCA_PATCH_SKIP_SEARCH_THRESHOLD_MEDIUM 0x200000
+#define NCA_PATCH_SKIP_SEARCH_THRESHOLD_LARGE 0x1000000
+#define NCA_PATCH_SKIP_SEARCH_STEP_SMALL 0x400
+#define NCA_PATCH_SKIP_SEARCH_STEP_MEDIUM 0x4000
+#define NCA_PATCH_SKIP_SEARCH_STEP_LARGE 0x10000
 
 typedef struct
 {
@@ -59,15 +65,67 @@ typedef struct
     uint32_t slot_count;
 } nca_base_block_index_t;
 
-static void nca_read_file_exact(FILE *file, uint64_t offset, void *buffer, size_t size, const char *error_message);
-static uint64_t nca_measure_base_match(FILE *base_file, uint64_t base_size, uint64_t base_offset, FILE *current_file, uint64_t current_size, uint64_t current_offset);
-static uint64_t nca_measure_base_match_backwards(FILE *base_file, uint64_t base_offset, FILE *current_file, uint64_t current_offset, uint64_t max_backtrack_size);
+typedef struct
+{
+    FILE *file;
+    unsigned char *buffer;
+    uint64_t file_size;
+    uint64_t window_offset;
+    size_t window_size;
+    size_t capacity;
+} nca_cached_reader_t;
+
+typedef struct
+{
+    FILE *file;
+    unsigned char *chunk;
+    uint64_t *fingerprints;
+    uint64_t file_size;
+    uint64_t chunk_offset;
+    size_t chunk_size;
+    size_t loaded_size;
+} nca_current_block_cache_t;
+
+typedef struct
+{
+    uint64_t hash;
+    uint32_t index;
+    const char *path;
+} nca_path_hash_entry_t;
+
+typedef struct
+{
+    nca_path_hash_entry_t *entries;
+    uint32_t slot_count;
+} nca_path_hash_table_t;
+
+typedef struct
+{
+    uint64_t hash;
+    uint64_t size;
+    uint64_t signature;
+    uint32_t count;
+    uint32_t index;
+} nca_signature_hash_entry_t;
+
+typedef struct
+{
+    nca_signature_hash_entry_t *entries;
+    uint32_t slot_count;
+} nca_signature_hash_table_t;
+
+static uint32_t nca_next_power_of_two_u32(uint32_t value);
+static uint64_t nca_measure_base_match(nca_cached_reader_t *base_reader, uint64_t base_size, uint64_t base_offset, nca_cached_reader_t *current_reader, uint64_t current_size, uint64_t current_offset);
+static uint64_t nca_measure_base_match_backwards(nca_cached_reader_t *base_reader, uint64_t base_offset, nca_cached_reader_t *current_reader, uint64_t current_offset, uint64_t max_backtrack_size);
 static int nca_try_read_file_exact(FILE *file, uint64_t offset, void *buffer, size_t size);
 static int nca_compare_patch_hints(const void *left, const void *right);
 static void nca_merge_patch_hints(nca_patch_hint_t *hints, uint32_t *hint_count);
 static const nca_patch_hint_t *nca_find_patch_hint(const nca_patch_hint_t *hints, uint32_t hint_count, uint64_t current_offset);
 static uint64_t nca_hash_bytes(const unsigned char *data, size_t size, uint64_t seed);
+static uint64_t nca_hash_block(const unsigned char *block);
 static uint64_t nca_compute_file_hint_signature(const filepath_t *source_path, uint64_t size);
+static uint64_t nca_choose_patch_probe_step(uint64_t pending_patch_size);
+static void nca_profile_add(double *total_ms, uint64_t start_ticks);
 
 static uint64_t nca_get_file_size(FILE *file)
 {
@@ -83,6 +141,325 @@ static uint32_t nca_get_section_generation(const nca_fs_header_t *fs_header)
     const uint8_t *b = (const uint8_t *)fs_header->section_ctr + 4;
     return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
            ((uint32_t)b[2] << 8)  |  (uint32_t)b[3];
+}
+
+static uint64_t nca_profile_now_ticks(void)
+{
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return ((uint64_t)ts.tv_sec * 1000000000ULL) + (uint64_t)ts.tv_nsec;
+}
+
+static void nca_profile_add(double *total_ms, uint64_t start_ticks)
+{
+    uint64_t elapsed = nca_profile_now_ticks() - start_ticks;
+    *total_ms += (double)elapsed / 1000000.0;
+}
+
+static uint64_t nca_hash_string(const char *value)
+{
+    static const uint64_t fnv_offset_basis = 0xCBF29CE484222325ULL;
+    return nca_hash_bytes((const unsigned char *)value, strlen(value), fnv_offset_basis);
+}
+
+static void nca_cached_reader_init(nca_cached_reader_t *reader, FILE *file, uint64_t file_size, size_t capacity)
+{
+    memset(reader, 0, sizeof(*reader));
+    reader->file = file;
+    reader->file_size = file_size;
+    reader->capacity = capacity;
+    if (file == NULL || capacity == 0)
+    {
+        return;
+    }
+
+    reader->buffer = malloc(capacity);
+    if (reader->buffer == NULL)
+    {
+        FATAL_ERROR("Failed to allocate cached reader buffer");
+    }
+}
+
+static void nca_cached_reader_free(nca_cached_reader_t *reader)
+{
+    free(reader->buffer);
+    memset(reader, 0, sizeof(*reader));
+}
+
+static int nca_cached_reader_try_read(nca_cached_reader_t *reader, uint64_t offset, void *buffer, size_t size)
+{
+    if (size == 0)
+    {
+        return 1;
+    }
+    if (reader->file == NULL || offset + size > reader->file_size)
+    {
+        return 0;
+    }
+    if (size > reader->capacity)
+    {
+        return nca_try_read_file_exact(reader->file, offset, buffer, size);
+    }
+
+    if (reader->window_size == 0 ||
+        offset < reader->window_offset ||
+        offset + size > reader->window_offset + reader->window_size)
+    {
+        uint64_t window_offset = offset - (offset % reader->capacity);
+        if (window_offset + reader->capacity < offset + size)
+        {
+            window_offset = offset;
+        }
+        if (window_offset + reader->capacity > reader->file_size && reader->file_size > reader->capacity)
+        {
+            window_offset = reader->file_size - reader->capacity;
+        }
+
+        reader->window_offset = window_offset;
+        reader->window_size = (size_t)(reader->file_size - window_offset);
+        if (reader->window_size > reader->capacity)
+        {
+            reader->window_size = reader->capacity;
+        }
+
+        if (!nca_try_read_file_exact(reader->file, reader->window_offset, reader->buffer, reader->window_size))
+        {
+            reader->window_size = 0;
+            return 0;
+        }
+    }
+
+    memcpy(buffer, reader->buffer + (offset - reader->window_offset), size);
+    return 1;
+}
+
+static void nca_current_block_cache_init(nca_current_block_cache_t *cache, FILE *file, uint64_t file_size, size_t chunk_size)
+{
+    memset(cache, 0, sizeof(*cache));
+    cache->file = file;
+    cache->file_size = file_size;
+    cache->chunk_size = chunk_size;
+    if (file == NULL || chunk_size == 0)
+    {
+        return;
+    }
+
+    cache->chunk = malloc(chunk_size);
+    cache->fingerprints = malloc((chunk_size / NCA_PATCH_BLOCK_SIZE) * sizeof(*cache->fingerprints));
+    if (cache->chunk == NULL || cache->fingerprints == NULL)
+    {
+        free(cache->chunk);
+        free(cache->fingerprints);
+        FATAL_ERROR("Failed to allocate current block cache");
+    }
+}
+
+static void nca_current_block_cache_free(nca_current_block_cache_t *cache)
+{
+    free(cache->chunk);
+    free(cache->fingerprints);
+    memset(cache, 0, sizeof(*cache));
+}
+
+static void nca_current_block_cache_load(nca_current_block_cache_t *cache, uint64_t offset)
+{
+    uint64_t chunk_offset = offset - (offset % cache->chunk_size);
+    size_t to_read;
+
+    if (cache->loaded_size > 0 &&
+        offset >= cache->chunk_offset &&
+        offset + NCA_PATCH_BLOCK_SIZE <= cache->chunk_offset + cache->loaded_size)
+    {
+        return;
+    }
+
+    cache->chunk_offset = chunk_offset;
+    to_read = (size_t)(cache->file_size - chunk_offset);
+    if (to_read > cache->chunk_size)
+    {
+        to_read = cache->chunk_size;
+    }
+    to_read -= to_read % NCA_PATCH_BLOCK_SIZE;
+    cache->loaded_size = to_read;
+
+    if (to_read == 0)
+    {
+        return;
+    }
+    if (!nca_try_read_file_exact(cache->file, cache->chunk_offset, cache->chunk, to_read))
+    {
+        FATAL_ERROR("Failed to read current RomFS section");
+    }
+
+    for (size_t i = 0; i < to_read; i += NCA_PATCH_BLOCK_SIZE)
+    {
+        cache->fingerprints[i / NCA_PATCH_BLOCK_SIZE] = nca_hash_block(cache->chunk + i);
+    }
+}
+
+static const unsigned char *nca_current_block_cache_get_block(nca_current_block_cache_t *cache, uint64_t offset, uint64_t *out_fingerprint)
+{
+    nca_current_block_cache_load(cache, offset);
+    if (cache->loaded_size == 0 || offset + NCA_PATCH_BLOCK_SIZE > cache->chunk_offset + cache->loaded_size)
+    {
+        return NULL;
+    }
+
+    size_t block_index = (size_t)((offset - cache->chunk_offset) / NCA_PATCH_BLOCK_SIZE);
+    *out_fingerprint = cache->fingerprints[block_index];
+    return cache->chunk + (block_index * NCA_PATCH_BLOCK_SIZE);
+}
+
+static void nca_path_hash_table_init(nca_path_hash_table_t *table, uint32_t count)
+{
+    memset(table, 0, sizeof(*table));
+    if (count == 0)
+    {
+        return;
+    }
+
+    table->slot_count = nca_next_power_of_two_u32(count * 2);
+    table->entries = calloc(table->slot_count, sizeof(*table->entries));
+    if (table->entries == NULL)
+    {
+        FATAL_ERROR("Failed to allocate path hash table");
+    }
+}
+
+static void nca_path_hash_table_free(nca_path_hash_table_t *table)
+{
+    free(table->entries);
+    memset(table, 0, sizeof(*table));
+}
+
+static void nca_path_hash_table_insert(nca_path_hash_table_t *table, const char *path, uint32_t index)
+{
+    uint64_t hash = nca_hash_string(path);
+    uint32_t mask = table->slot_count - 1;
+    uint32_t slot = (uint32_t)hash & mask;
+
+    for (uint32_t probe = 0; probe < table->slot_count; probe++)
+    {
+        nca_path_hash_entry_t *entry = &table->entries[(slot + probe) & mask];
+        if (entry->path == NULL)
+        {
+            entry->hash = hash;
+            entry->index = index;
+            entry->path = path;
+            return;
+        }
+    }
+
+    FATAL_ERROR("Path hash table is full");
+}
+
+static int nca_path_hash_table_find(const nca_path_hash_table_t *table, const char *path, uint32_t *out_index)
+{
+    uint64_t hash = nca_hash_string(path);
+    uint32_t mask;
+    uint32_t slot;
+
+    if (table->entries == NULL || table->slot_count == 0)
+    {
+        return 0;
+    }
+
+    mask = table->slot_count - 1;
+    slot = (uint32_t)hash & mask;
+    for (uint32_t probe = 0; probe < table->slot_count; probe++)
+    {
+        const nca_path_hash_entry_t *entry = &table->entries[(slot + probe) & mask];
+        if (entry->path == NULL)
+        {
+            return 0;
+        }
+        if (entry->hash == hash && strcmp(entry->path, path) == 0)
+        {
+            *out_index = entry->index;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static void nca_signature_hash_table_init(nca_signature_hash_table_t *table, uint32_t count)
+{
+    memset(table, 0, sizeof(*table));
+    if (count == 0)
+    {
+        return;
+    }
+
+    table->slot_count = nca_next_power_of_two_u32(count * 2);
+    table->entries = calloc(table->slot_count, sizeof(*table->entries));
+    if (table->entries == NULL)
+    {
+        FATAL_ERROR("Failed to allocate signature hash table");
+    }
+}
+
+static void nca_signature_hash_table_free(nca_signature_hash_table_t *table)
+{
+    free(table->entries);
+    memset(table, 0, sizeof(*table));
+}
+
+static void nca_signature_hash_table_insert(nca_signature_hash_table_t *table, uint64_t size, uint64_t signature, uint32_t index)
+{
+    uint64_t hash = nca_hash_bytes((const unsigned char *)&size, sizeof(size), signature);
+    uint32_t mask = table->slot_count - 1;
+    uint32_t slot = (uint32_t)hash & mask;
+
+    for (uint32_t probe = 0; probe < table->slot_count; probe++)
+    {
+        nca_signature_hash_entry_t *entry = &table->entries[(slot + probe) & mask];
+        if (entry->count == 0)
+        {
+            entry->hash = hash;
+            entry->size = size;
+            entry->signature = signature;
+            entry->count = 1;
+            entry->index = index;
+            return;
+        }
+        if (entry->hash == hash && entry->size == size && entry->signature == signature)
+        {
+            entry->count++;
+            return;
+        }
+    }
+
+    FATAL_ERROR("Signature hash table is full");
+}
+
+static const nca_signature_hash_entry_t *nca_signature_hash_table_find(const nca_signature_hash_table_t *table, uint64_t size, uint64_t signature)
+{
+    uint64_t hash = nca_hash_bytes((const unsigned char *)&size, sizeof(size), signature);
+    uint32_t mask;
+    uint32_t slot;
+
+    if (table->entries == NULL || table->slot_count == 0)
+    {
+        return NULL;
+    }
+
+    mask = table->slot_count - 1;
+    slot = (uint32_t)hash & mask;
+    for (uint32_t probe = 0; probe < table->slot_count; probe++)
+    {
+        const nca_signature_hash_entry_t *entry = &table->entries[(slot + probe) & mask];
+        if (entry->count == 0)
+        {
+            return NULL;
+        }
+        if (entry->hash == hash && entry->size == size && entry->signature == signature)
+        {
+            return entry;
+        }
+    }
+
+    return NULL;
 }
 
 static int nca_compare_patch_hints(const void *left, const void *right)
@@ -381,9 +758,8 @@ static void nca_build_base_block_index(FILE *base_file, uint64_t base_size, nca_
     free(chunk);
 }
 
-static uint64_t nca_find_indexed_base_match(const nca_base_block_index_t *index, FILE *base_file, uint64_t base_size, const unsigned char *current_block, FILE *current_file, uint64_t current_size, uint64_t current_offset, uint64_t *out_base_offset)
+static uint64_t nca_find_indexed_base_match(const nca_base_block_index_t *index, nca_cached_reader_t *base_reader, uint64_t base_size, uint64_t current_block_fingerprint, nca_cached_reader_t *current_reader, uint64_t current_size, uint64_t current_offset, uint64_t *out_base_offset)
 {
-    uint64_t fingerprint;
     uint32_t mask;
     uint32_t slot;
     uint64_t best_offset = 0;
@@ -394,9 +770,8 @@ static uint64_t nca_find_indexed_base_match(const nca_base_block_index_t *index,
         return 0;
     }
 
-    fingerprint = nca_hash_block(current_block);
     mask = index->slot_count - 1;
-    slot = (uint32_t)fingerprint & mask;
+    slot = (uint32_t)current_block_fingerprint & mask;
 
     for (uint32_t probe = 0; probe < NCA_PATCH_GLOBAL_INDEX_MAX_PROBES; probe++)
     {
@@ -406,7 +781,7 @@ static uint64_t nca_find_indexed_base_match(const nca_base_block_index_t *index,
         {
             break;
         }
-        if (entry->fingerprint != fingerprint)
+        if (entry->fingerprint != current_block_fingerprint)
         {
             continue;
         }
@@ -414,7 +789,7 @@ static uint64_t nca_find_indexed_base_match(const nca_base_block_index_t *index,
         for (uint32_t candidate_index = 0; candidate_index < entry->candidate_count; candidate_index++)
         {
             uint64_t candidate_offset = entry->base_offsets[candidate_index];
-            uint64_t candidate_size = nca_measure_base_match(base_file, base_size, candidate_offset, current_file, current_size, current_offset);
+            uint64_t candidate_size = nca_measure_base_match(base_reader, base_size, candidate_offset, current_reader, current_size, current_offset);
 
             if (candidate_size >= NCA_PATCH_RELOCATED_REUSE_MIN_SIZE && candidate_size > best_size)
             {
@@ -564,12 +939,21 @@ static void nca_build_full_patch_layout(nca_patch_layout_t *layout, uint64_t siz
     nca_append_patch_data_segment(layout, &capacity, 0, size);
 }
 
-static void nca_read_file_exact(FILE *file, uint64_t offset, void *buffer, size_t size, const char *error_message)
+static uint64_t nca_choose_patch_probe_step(uint64_t pending_patch_size)
 {
-    if (!nca_try_read_file_exact(file, offset, buffer, size))
+    if (pending_patch_size >= NCA_PATCH_SKIP_SEARCH_THRESHOLD_LARGE)
     {
-        FATAL_ERROR(error_message);
+        return NCA_PATCH_SKIP_SEARCH_STEP_LARGE;
     }
+    if (pending_patch_size >= NCA_PATCH_SKIP_SEARCH_THRESHOLD_MEDIUM)
+    {
+        return NCA_PATCH_SKIP_SEARCH_STEP_MEDIUM;
+    }
+    if (pending_patch_size >= NCA_PATCH_SKIP_SEARCH_THRESHOLD_SMALL)
+    {
+        return NCA_PATCH_SKIP_SEARCH_STEP_SMALL;
+    }
+    return NCA_PATCH_BLOCK_SIZE;
 }
 
 static int nca_try_read_file_exact(FILE *file, uint64_t offset, void *buffer, size_t size)
@@ -582,7 +966,7 @@ static int nca_try_read_file_exact(FILE *file, uint64_t offset, void *buffer, si
     return fread(buffer, 1, size, file) == size;
 }
 
-static uint64_t nca_measure_base_match(FILE *base_file, uint64_t base_size, uint64_t base_offset, FILE *current_file, uint64_t current_size, uint64_t current_offset)
+static uint64_t nca_measure_base_match(nca_cached_reader_t *base_reader, uint64_t base_size, uint64_t base_offset, nca_cached_reader_t *current_reader, uint64_t current_size, uint64_t current_offset)
 {
     unsigned char base_buffer[NCA_PATCH_COMPARE_BUFFER_SIZE];
     unsigned char current_buffer[NCA_PATCH_COMPARE_BUFFER_SIZE];
@@ -605,8 +989,8 @@ static uint64_t nca_measure_base_match(FILE *base_file, uint64_t base_size, uint
         }
         read_size -= (read_size % NCA_PATCH_BLOCK_SIZE);
 
-        if (!nca_try_read_file_exact(base_file, base_offset + matched_size, base_buffer, (size_t)read_size) ||
-            !nca_try_read_file_exact(current_file, current_offset + matched_size, current_buffer, (size_t)read_size))
+        if (!nca_cached_reader_try_read(base_reader, base_offset + matched_size, base_buffer, (size_t)read_size) ||
+            !nca_cached_reader_try_read(current_reader, current_offset + matched_size, current_buffer, (size_t)read_size))
         {
             return 0;
         }
@@ -633,7 +1017,7 @@ static uint64_t nca_measure_base_match(FILE *base_file, uint64_t base_size, uint
     return matched_size;
 }
 
-static uint64_t nca_measure_base_match_backwards(FILE *base_file, uint64_t base_offset, FILE *current_file, uint64_t current_offset, uint64_t max_backtrack_size)
+static uint64_t nca_measure_base_match_backwards(nca_cached_reader_t *base_reader, uint64_t base_offset, nca_cached_reader_t *current_reader, uint64_t current_offset, uint64_t max_backtrack_size)
 {
     unsigned char base_buffer[NCA_PATCH_COMPARE_BUFFER_SIZE];
     unsigned char current_buffer[NCA_PATCH_COMPARE_BUFFER_SIZE];
@@ -658,8 +1042,8 @@ static uint64_t nca_measure_base_match_backwards(FILE *base_file, uint64_t base_
         }
         read_size -= (read_size % NCA_PATCH_BLOCK_SIZE);
 
-        if (!nca_try_read_file_exact(base_file, base_offset - matched_size - read_size, base_buffer, (size_t)read_size) ||
-            !nca_try_read_file_exact(current_file, current_offset - matched_size - read_size, current_buffer, (size_t)read_size))
+        if (!nca_cached_reader_try_read(base_reader, base_offset - matched_size - read_size, base_buffer, (size_t)read_size) ||
+            !nca_cached_reader_try_read(current_reader, current_offset - matched_size - read_size, current_buffer, (size_t)read_size))
         {
             return matched_size;
         }
@@ -684,9 +1068,8 @@ static uint64_t nca_measure_base_match_backwards(FILE *base_file, uint64_t base_
     return matched_size;
 }
 
-static uint64_t nca_find_base_match(const nca_base_block_index_t *index, const nca_patch_hint_t *hints, uint32_t hint_count, FILE *base_file, uint64_t base_size, FILE *current_file, uint64_t current_size, uint64_t current_offset, uint64_t *out_base_offset)
+static uint64_t nca_find_base_match(const nca_base_block_index_t *index, const nca_patch_hint_t *hints, uint32_t hint_count, nca_cached_reader_t *base_reader, uint64_t base_size, nca_cached_reader_t *current_reader, uint64_t current_size, uint64_t current_offset, const unsigned char *current_block, uint64_t current_block_fingerprint, uint64_t *out_base_offset)
 {
-    unsigned char current_block[NCA_PATCH_BLOCK_SIZE];
     unsigned char base_block[NCA_PATCH_BLOCK_SIZE];
     uint64_t best_offset = 0;
     uint64_t best_size = 0;
@@ -697,14 +1080,12 @@ static uint64_t nca_find_base_match(const nca_base_block_index_t *index, const n
         return 0;
     }
 
-    nca_read_file_exact(current_file, current_offset, current_block, sizeof(current_block), "Failed to read current RomFS section");
-
     {
         const nca_patch_hint_t *hint = nca_find_patch_hint(hints, hint_count, current_offset);
         if (hint != NULL)
         {
             uint64_t candidate_offset = hint->base_offset + (current_offset - hint->current_offset);
-            uint64_t candidate_size = nca_measure_base_match(base_file, base_size, candidate_offset, current_file, current_size, current_offset);
+            uint64_t candidate_size = nca_measure_base_match(base_reader, base_size, candidate_offset, current_reader, current_size, current_offset);
             uint64_t hinted_remaining_size = hint->size - (current_offset - hint->current_offset);
 
             if (candidate_size > hinted_remaining_size)
@@ -726,11 +1107,14 @@ static uint64_t nca_find_base_match(const nca_base_block_index_t *index, const n
 
     if (current_offset + NCA_PATCH_BLOCK_SIZE <= base_size)
     {
-        nca_read_file_exact(base_file, current_offset, base_block, sizeof(base_block), "Failed to read base RomFS section");
-        if (memcmp(base_block, current_block, sizeof(current_block)) == 0)
+        if (!nca_cached_reader_try_read(base_reader, current_offset, base_block, sizeof(base_block)))
+        {
+            FATAL_ERROR("Failed to read base RomFS section");
+        }
+        if (memcmp(base_block, current_block, NCA_PATCH_BLOCK_SIZE) == 0)
         {
             best_offset = current_offset;
-            best_size = nca_measure_base_match(base_file, base_size, current_offset, current_file, current_size, current_offset);
+            best_size = nca_measure_base_match(base_reader, base_size, current_offset, current_reader, current_size, current_offset);
             if (best_size >= NCA_PATCH_GOOD_MATCH_SIZE)
             {
                 *out_base_offset = best_offset;
@@ -758,16 +1142,16 @@ static uint64_t nca_find_base_match(const nca_base_block_index_t *index, const n
             uint64_t candidate_offset = candidate_offsets[i];
             uint64_t candidate_size;
 
-            if (!nca_try_read_file_exact(base_file, candidate_offset, base_block, sizeof(base_block)))
+            if (!nca_cached_reader_try_read(base_reader, candidate_offset, base_block, sizeof(base_block)))
             {
                 continue;
             }
-            if (memcmp(base_block, current_block, sizeof(current_block)) != 0)
+            if (memcmp(base_block, current_block, NCA_PATCH_BLOCK_SIZE) != 0)
             {
                 continue;
             }
 
-            candidate_size = nca_measure_base_match(base_file, base_size, candidate_offset, current_file, current_size, current_offset);
+            candidate_size = nca_measure_base_match(base_reader, base_size, candidate_offset, current_reader, current_size, current_offset);
             if (candidate_size >= NCA_PATCH_RELOCATED_REUSE_MIN_SIZE && candidate_size > best_size)
             {
                 best_offset = candidate_offset;
@@ -783,7 +1167,7 @@ static uint64_t nca_find_base_match(const nca_base_block_index_t *index, const n
 
     {
         uint64_t indexed_match_offset = 0;
-        indexed_match_size = nca_find_indexed_base_match(index, base_file, base_size, current_block, current_file, current_size, current_offset, &indexed_match_offset);
+        indexed_match_size = nca_find_indexed_base_match(index, base_reader, base_size, current_block_fingerprint, current_reader, current_size, current_offset, &indexed_match_offset);
         if (indexed_match_size >= NCA_PATCH_GOOD_MATCH_SIZE && indexed_match_size > best_size)
         {
             best_offset = indexed_match_offset;
@@ -800,7 +1184,7 @@ static uint64_t nca_find_base_match(const nca_base_block_index_t *index, const n
     return 0;
 }
 
-static void nca_extend_base_match_backwards(const nca_base_match_t *input_match, FILE *base_file, FILE *current_file, uint64_t pending_patch_offset, nca_base_match_t *out_match)
+static void nca_extend_base_match_backwards(const nca_base_match_t *input_match, nca_cached_reader_t *base_reader, nca_cached_reader_t *current_reader, uint64_t pending_patch_offset, nca_base_match_t *out_match)
 {
     uint64_t backtrack_size = 0;
 
@@ -811,9 +1195,9 @@ static void nca_extend_base_match_backwards(const nca_base_match_t *input_match,
     }
 
     backtrack_size = nca_measure_base_match_backwards(
-        base_file,
+        base_reader,
         input_match->base_offset,
-        current_file,
+        current_reader,
         input_match->virtual_offset,
         input_match->virtual_offset - pending_patch_offset);
 
@@ -825,6 +1209,9 @@ static void nca_extend_base_match_backwards(const nca_base_match_t *input_match,
 static void nca_build_patch_layout(FILE *base_file, uint64_t base_size, FILE *current_file, uint64_t current_size, const nca_patch_hint_t *hints, uint32_t hint_count, nca_patch_layout_t *layout)
 {
     nca_base_block_index_t base_index;
+    nca_cached_reader_t base_reader;
+    nca_cached_reader_t current_reader;
+    nca_current_block_cache_t current_block_cache;
     uint32_t capacity = 0;
     uint64_t pending_patch_offset = UINT64_MAX;
     static const uint64_t merge_thresholds[] = {0x20, 0x40, 0x80, 0x100, 0x200, 0x400};
@@ -832,10 +1219,16 @@ static void nca_build_patch_layout(FILE *base_file, uint64_t base_size, FILE *cu
     free(layout->segments);
     memset(layout, 0, sizeof(*layout));
     nca_base_block_index_init(&base_index);
+    nca_cached_reader_init(&base_reader, base_file, base_size, NCA_PATCH_INDEX_READ_CHUNK);
+    nca_cached_reader_init(&current_reader, current_file, current_size, NCA_PATCH_INDEX_READ_CHUNK);
+    nca_current_block_cache_init(&current_block_cache, current_file, current_size, NCA_PATCH_INDEX_READ_CHUNK);
 
     if (base_file == NULL || base_size == 0)
     {
         nca_build_full_patch_layout(layout, current_size);
+        nca_current_block_cache_free(&current_block_cache);
+        nca_cached_reader_free(&current_reader);
+        nca_cached_reader_free(&base_reader);
         return;
     }
 
@@ -846,18 +1239,25 @@ static void nca_build_patch_layout(FILE *base_file, uint64_t base_size, FILE *cu
     {
         nca_base_match_t base_match;
         uint64_t base_match_size;
+        const unsigned char *current_block;
+        uint64_t current_block_fingerprint = 0;
 
         memset(&base_match, 0, sizeof(base_match));
         base_match.virtual_offset = offset;
         base_match.size = 0;
-        base_match_size = nca_find_base_match(&base_index, hints, hint_count, base_file, base_size, current_file, current_size, offset, &base_match.base_offset);
+        current_block = nca_current_block_cache_get_block(&current_block_cache, offset, &current_block_fingerprint);
+        if (current_block == NULL)
+        {
+            FATAL_ERROR("Failed to read current RomFS block cache");
+        }
+        base_match_size = nca_find_base_match(&base_index, hints, hint_count, &base_reader, base_size, &current_reader, current_size, offset, current_block, current_block_fingerprint, &base_match.base_offset);
         base_match.size = base_match_size;
 
         if (base_match.size > 0)
         {
             if (pending_patch_offset != UINT64_MAX)
             {
-                nca_extend_base_match_backwards(&base_match, base_file, current_file, pending_patch_offset, &base_match);
+                nca_extend_base_match_backwards(&base_match, &base_reader, &current_reader, pending_patch_offset, &base_match);
             }
 
             if (pending_patch_offset != UINT64_MAX)
@@ -871,11 +1271,25 @@ static void nca_build_patch_layout(FILE *base_file, uint64_t base_size, FILE *cu
         }
         else
         {
+            uint64_t advance = NCA_PATCH_BLOCK_SIZE;
+
             if (pending_patch_offset == UINT64_MAX)
             {
                 pending_patch_offset = offset;
             }
-            offset += NCA_PATCH_BLOCK_SIZE;
+
+            advance = nca_choose_patch_probe_step((offset - pending_patch_offset) + NCA_PATCH_BLOCK_SIZE);
+            if (offset + advance > current_size)
+            {
+                advance = current_size - offset;
+                advance -= (advance % NCA_PATCH_BLOCK_SIZE);
+                if (advance == 0)
+                {
+                    advance = NCA_PATCH_BLOCK_SIZE;
+                }
+            }
+
+            offset += advance;
         }
     }
 
@@ -902,20 +1316,24 @@ static void nca_build_patch_layout(FILE *base_file, uint64_t base_size, FILE *cu
     }
 
     nca_base_block_index_free(&base_index);
+    nca_current_block_cache_free(&current_block_cache);
+    nca_cached_reader_free(&current_reader);
+    nca_cached_reader_free(&base_reader);
 }
 
 static nca_patch_hint_t *nca_build_patch_hints(const romfs_file_layout_entry_t *base_files, uint32_t base_file_count, uint64_t base_section_offset, const romfs_file_layout_entry_t *current_files, uint32_t current_file_count, uint64_t current_section_offset, uint32_t *out_hint_count)
 {
     nca_patch_hint_t *hints = NULL;
     uint32_t hint_count = 0;
-    uint32_t base_index = 0;
-    uint32_t current_index = 0;
     bool *base_matched = NULL;
     bool *current_matched = NULL;
     uint64_t *base_signatures = NULL;
     uint64_t *current_signatures = NULL;
-    bool *base_signature_valid = NULL;
-    bool *current_signature_valid = NULL;
+    nca_path_hash_table_t base_path_table;
+    nca_signature_hash_table_t base_signature_table;
+    nca_signature_hash_table_t current_signature_table;
+    uint32_t unmatched_base_count = 0;
+    uint32_t unmatched_current_count = 0;
 
     *out_hint_count = 0;
     if (base_files == NULL || current_files == NULL || base_file_count == 0 || current_file_count == 0)
@@ -933,131 +1351,38 @@ static nca_patch_hint_t *nca_build_patch_hints(const romfs_file_layout_entry_t *
     current_matched = calloc(current_file_count, sizeof(*current_matched));
     base_signatures = calloc(base_file_count, sizeof(*base_signatures));
     current_signatures = calloc(current_file_count, sizeof(*current_signatures));
-    base_signature_valid = calloc(base_file_count, sizeof(*base_signature_valid));
-    current_signature_valid = calloc(current_file_count, sizeof(*current_signature_valid));
     if (base_matched == NULL || current_matched == NULL ||
-        base_signatures == NULL || current_signatures == NULL ||
-        base_signature_valid == NULL || current_signature_valid == NULL)
+        base_signatures == NULL || current_signatures == NULL)
     {
         free(hints);
         free(base_matched);
         free(current_matched);
         free(base_signatures);
         free(current_signatures);
-        free(base_signature_valid);
-        free(current_signature_valid);
         FATAL_ERROR("Failed to allocate RomFS patch hint metadata");
     }
 
-    while (base_index < base_file_count && current_index < current_file_count)
+    memset(&base_path_table, 0, sizeof(base_path_table));
+    memset(&base_signature_table, 0, sizeof(base_signature_table));
+    memset(&current_signature_table, 0, sizeof(current_signature_table));
+    nca_path_hash_table_init(&base_path_table, base_file_count);
+    for (uint32_t i = 0; i < base_file_count; i++)
     {
-        int compare = strcmp(base_files[base_index].path, current_files[current_index].path);
-        if (compare < 0)
-        {
-            base_index++;
-            continue;
-        }
-        if (compare > 0)
-        {
-            current_index++;
-            continue;
-        }
-
-        uint64_t base_size = base_files[base_index].size;
-        uint64_t current_size = current_files[current_index].size;
-        uint64_t shared_size = (base_size < current_size) ? base_size : current_size;
-        shared_size -= (shared_size % NCA_PATCH_BLOCK_SIZE);
-
-        if (shared_size >= NCA_PATCH_SAME_OFFSET_REUSE_MIN_SIZE)
-        {
-            hints[hint_count].base_offset = base_section_offset + base_files[base_index].offset;
-            hints[hint_count].current_offset = current_section_offset + current_files[current_index].offset;
-            hints[hint_count].size = shared_size;
-            hint_count++;
-            base_matched[base_index] = true;
-            current_matched[current_index] = true;
-        }
-
-        base_index++;
-        current_index++;
+        nca_path_hash_table_insert(&base_path_table, base_files[i].path, i);
     }
 
     for (uint32_t current_file_index = 0; current_file_index < current_file_count; current_file_index++)
     {
         uint32_t matched_base_index = UINT32_MAX;
-        uint32_t base_candidate_count = 0;
-        uint32_t current_candidate_count = 0;
-
-        if (current_matched[current_file_index])
+        if (nca_path_hash_table_find(&base_path_table, current_files[current_file_index].path, &matched_base_index))
         {
-            continue;
-        }
-
-        if (!current_signature_valid[current_file_index])
-        {
-            current_signatures[current_file_index] = nca_compute_file_hint_signature(&current_files[current_file_index].source_path, current_files[current_file_index].size);
-            current_signature_valid[current_file_index] = true;
-        }
-
-        for (uint32_t other_current_index = 0; other_current_index < current_file_count; other_current_index++)
-        {
-            if (current_matched[other_current_index] || current_files[other_current_index].size != current_files[current_file_index].size)
+            uint64_t shared_size = base_files[matched_base_index].size;
+            if (current_files[current_file_index].size < shared_size)
             {
-                continue;
+                shared_size = current_files[current_file_index].size;
             }
+            shared_size -= (shared_size % NCA_PATCH_BLOCK_SIZE);
 
-            if (!current_signature_valid[other_current_index])
-            {
-                current_signatures[other_current_index] = nca_compute_file_hint_signature(&current_files[other_current_index].source_path, current_files[other_current_index].size);
-                current_signature_valid[other_current_index] = true;
-            }
-
-            if (current_signatures[other_current_index] == current_signatures[current_file_index])
-            {
-                current_candidate_count++;
-                if (current_candidate_count > 1)
-                {
-                    break;
-                }
-            }
-        }
-
-        if (current_candidate_count != 1)
-        {
-            continue;
-        }
-
-        for (uint32_t base_file_index = 0; base_file_index < base_file_count; base_file_index++)
-        {
-            if (base_matched[base_file_index] || base_files[base_file_index].size != current_files[current_file_index].size)
-            {
-                continue;
-            }
-
-            if (!base_signature_valid[base_file_index])
-            {
-                base_signatures[base_file_index] = nca_compute_file_hint_signature(&base_files[base_file_index].source_path, base_files[base_file_index].size);
-                base_signature_valid[base_file_index] = true;
-            }
-
-            if (base_signatures[base_file_index] == current_signatures[current_file_index])
-            {
-                matched_base_index = base_file_index;
-                base_candidate_count++;
-                if (base_candidate_count > 1)
-                {
-                    break;
-                }
-            }
-        }
-
-        if (base_candidate_count != 1)
-        {
-            continue;
-        }
-
-        {
-            uint64_t shared_size = current_files[current_file_index].size - (current_files[current_file_index].size % NCA_PATCH_BLOCK_SIZE);
             if (shared_size >= NCA_PATCH_SAME_OFFSET_REUSE_MIN_SIZE)
             {
                 hints[hint_count].base_offset = base_section_offset + base_files[matched_base_index].offset;
@@ -1070,6 +1395,78 @@ static nca_patch_hint_t *nca_build_patch_hints(const romfs_file_layout_entry_t *
         }
     }
 
+    for (uint32_t i = 0; i < base_file_count; i++)
+    {
+        if (!base_matched[i])
+        {
+            unmatched_base_count++;
+        }
+    }
+    for (uint32_t current_file_index = 0; current_file_index < current_file_count; current_file_index++)
+    {
+        if (current_matched[current_file_index])
+        {
+            continue;
+        }
+        unmatched_current_count++;
+        current_signatures[current_file_index] = nca_compute_file_hint_signature(&current_files[current_file_index].source_path, current_files[current_file_index].size);
+    }
+    for (uint32_t base_file_index = 0; base_file_index < base_file_count; base_file_index++)
+    {
+        if (base_matched[base_file_index])
+        {
+            continue;
+        }
+        base_signatures[base_file_index] = nca_compute_file_hint_signature(&base_files[base_file_index].source_path, base_files[base_file_index].size);
+    }
+
+    nca_signature_hash_table_init(&current_signature_table, unmatched_current_count);
+    nca_signature_hash_table_init(&base_signature_table, unmatched_base_count);
+    for (uint32_t current_file_index = 0; current_file_index < current_file_count; current_file_index++)
+    {
+        if (!current_matched[current_file_index])
+        {
+            nca_signature_hash_table_insert(&current_signature_table, current_files[current_file_index].size, current_signatures[current_file_index], current_file_index);
+        }
+    }
+    for (uint32_t base_file_index = 0; base_file_index < base_file_count; base_file_index++)
+    {
+        if (!base_matched[base_file_index])
+        {
+            nca_signature_hash_table_insert(&base_signature_table, base_files[base_file_index].size, base_signatures[base_file_index], base_file_index);
+        }
+    }
+
+    for (uint32_t current_file_index = 0; current_file_index < current_file_count; current_file_index++)
+    {
+        const nca_signature_hash_entry_t *current_entry;
+        const nca_signature_hash_entry_t *base_entry;
+
+        if (current_matched[current_file_index])
+        {
+            continue;
+        }
+        current_entry = nca_signature_hash_table_find(&current_signature_table, current_files[current_file_index].size, current_signatures[current_file_index]);
+        base_entry = nca_signature_hash_table_find(&base_signature_table, current_files[current_file_index].size, current_signatures[current_file_index]);
+        if (current_entry == NULL || base_entry == NULL || current_entry->count != 1 || base_entry->count != 1 || base_matched[base_entry->index])
+        {
+            continue;
+        }
+
+        {
+            uint64_t shared_size = current_files[current_file_index].size - (current_files[current_file_index].size % NCA_PATCH_BLOCK_SIZE);
+            if (shared_size >= NCA_PATCH_SAME_OFFSET_REUSE_MIN_SIZE)
+            {
+                hints[hint_count].base_offset = base_section_offset + base_files[base_entry->index].offset;
+                hints[hint_count].current_offset = current_section_offset + current_files[current_file_index].offset;
+                hints[hint_count].size = shared_size;
+                hint_count++;
+                base_matched[base_entry->index] = true;
+                current_matched[current_file_index] = true;
+            }
+        }
+    }
+
     if (hint_count == 0)
     {
         free(hints);
@@ -1077,8 +1474,9 @@ static nca_patch_hint_t *nca_build_patch_hints(const romfs_file_layout_entry_t *
         free(current_matched);
         free(base_signatures);
         free(current_signatures);
-        free(base_signature_valid);
-        free(current_signature_valid);
+        nca_path_hash_table_free(&base_path_table);
+        nca_signature_hash_table_free(&base_signature_table);
+        nca_signature_hash_table_free(&current_signature_table);
         return NULL;
     }
 
@@ -1088,8 +1486,9 @@ static nca_patch_hint_t *nca_build_patch_hints(const romfs_file_layout_entry_t *
     free(current_matched);
     free(base_signatures);
     free(current_signatures);
-    free(base_signature_valid);
-    free(current_signature_valid);
+    nca_path_hash_table_free(&base_path_table);
+    nca_signature_hash_table_free(&base_signature_table);
+    nca_signature_hash_table_free(&current_signature_table);
     *out_hint_count = hint_count;
     return hints;
 }
@@ -1132,7 +1531,7 @@ static void nca_copy_file_range(FILE *dst, uint64_t dst_offset, FILE *src, uint6
     free(buffer);
 }
 
-static uint64_t nca_build_romfs_section_data(hp_settings_t *settings, filepath_t *romfs_dir, const char *prefix, filepath_t *out_section_path, romfs_superblock_t *out_superblock)
+static uint64_t nca_build_romfs_section_data(hp_settings_t *settings, filepath_t *romfs_dir, const char *prefix, filepath_t *out_section_path, romfs_superblock_t *out_superblock, romfs_build_result_t *out_build_result)
 {
     filepath_t ivfc_lvls_path[6];
 
@@ -1150,7 +1549,15 @@ static uint64_t nca_build_romfs_section_data(hp_settings_t *settings, filepath_t
     }
 
     printf("\n===> Building RomFS\n");
-    romfs_build(romfs_dir, &ivfc_lvls_path[5], &out_superblock->ivfc_header.level_headers[5].hash_data_size);
+    if (out_build_result != NULL)
+    {
+        romfs_build_with_layout(romfs_dir, &ivfc_lvls_path[5], out_build_result);
+        out_superblock->ivfc_header.level_headers[5].hash_data_size = out_build_result->image_size;
+    }
+    else
+    {
+        romfs_build(romfs_dir, &ivfc_lvls_path[5], &out_superblock->ivfc_header.level_headers[5].hash_data_size);
+    }
     out_superblock->ivfc_header.level_headers[5].block_size = 0x0E;
 
     printf("\n===> Creating IVFC levels\n");
@@ -1349,14 +1756,24 @@ static uint64_t nca_prepare_romfs_section(hp_settings_t *settings, filepath_t *r
     filepath_t base_section_path;
     filepath_t *base_section_ptr = NULL;
     romfs_superblock_t base_superblock;
-    romfs_file_layout_entry_t *current_file_layout = NULL;
-    romfs_file_layout_entry_t *base_file_layout = NULL;
-    uint32_t current_file_count = 0;
-    uint32_t base_file_count = 0;
+    romfs_build_result_t current_build;
+    romfs_build_result_t base_build;
     nca_patch_hint_t *patch_hints = NULL;
     uint32_t patch_hint_count = 0;
+    uint64_t profile_start = 0;
 
-    uint64_t current_size = nca_build_romfs_section_data(settings, romfs_dir, prefix, &current_section_path, &fs_header->romfs_superblock);
+    memset(&current_build, 0, sizeof(current_build));
+    memset(&base_build, 0, sizeof(base_build));
+
+    if (settings->profile)
+    {
+        profile_start = nca_profile_now_ticks();
+    }
+    uint64_t current_size = nca_build_romfs_section_data(settings, romfs_dir, prefix, &current_section_path, &fs_header->romfs_superblock, settings->create_patch ? &current_build : NULL);
+    if (settings->profile)
+    {
+        nca_profile_add(&settings->profile_romfs_current_ms, profile_start);
+    }
     nca_prepare_romfs_fs_header(fs_header, settings->plaintext ? CRYPT_NONE : CRYPT_CTR);
 
     if (!settings->create_patch)
@@ -1370,19 +1787,33 @@ static uint64_t nca_prepare_romfs_section(hp_settings_t *settings, filepath_t *r
         char base_prefix[MAX_PATH];
         snprintf(base_prefix, sizeof(base_prefix), "%s_base", prefix);
         memset(&base_superblock, 0, sizeof(base_superblock));
-        nca_build_romfs_section_data(settings, base_romfs_dir, base_prefix, &base_section_path, &base_superblock);
+        if (settings->profile)
+        {
+            profile_start = nca_profile_now_ticks();
+        }
+        nca_build_romfs_section_data(settings, base_romfs_dir, base_prefix, &base_section_path, &base_superblock, &base_build);
+        if (settings->profile)
+        {
+            nca_profile_add(&settings->profile_romfs_base_ms, profile_start);
+        }
         base_section_ptr = &base_section_path;
 
-        romfs_collect_file_layout(romfs_dir, &current_file_layout, &current_file_count);
-        romfs_collect_file_layout(base_romfs_dir, &base_file_layout, &base_file_count);
+        if (settings->profile)
+        {
+            profile_start = nca_profile_now_ticks();
+        }
         patch_hints = nca_build_patch_hints(
-            base_file_layout,
-            base_file_count,
+            base_build.layout.entries,
+            base_build.layout.entry_count,
             base_superblock.ivfc_header.level_headers[5].logical_offset,
-            current_file_layout,
-            current_file_count,
+            current_build.layout.entries,
+            current_build.layout.entry_count,
             fs_header->romfs_superblock.ivfc_header.level_headers[5].logical_offset,
             &patch_hint_count);
+        if (settings->profile)
+        {
+            nca_profile_add(&settings->profile_patch_hints_ms, profile_start);
+        }
     }
 
     filepath_init(&patch_section_path);
@@ -1390,11 +1821,19 @@ static uint64_t nca_prepare_romfs_section(hp_settings_t *settings, filepath_t *r
     filepath_append(&patch_section_path, "%s_patch_section", prefix);
 
     filepath_copy(out_section_path, &patch_section_path);
+    if (settings->profile)
+    {
+        profile_start = nca_profile_now_ticks();
+    }
     uint64_t patch_size = nca_build_patch_romfs_section(base_section_ptr, &current_section_path, out_section_path, fs_header, patch_hints, patch_hint_count);
+    if (settings->profile)
+    {
+        nca_profile_add(&settings->profile_patch_diff_ms, profile_start);
+    }
 
     free(patch_hints);
-    romfs_free_file_layout(current_file_layout, current_file_count);
-    romfs_free_file_layout(base_file_layout, base_file_count);
+    romfs_free_build_result(&current_build);
+    romfs_free_build_result(&base_build);
     return patch_size;
 }
 
@@ -2209,65 +2648,77 @@ static void nca_encrypt_bktr_section(FILE *nca_file, nca_header_t *nca_header, u
 
 void nca_encrypt_section(FILE *nca_file, nca_header_t *nca_header, uint8_t section_index, hp_settings_t *settings)
 {
+    uint64_t profile_start = 0;
+    if (settings->profile)
+    {
+        profile_start = nca_profile_now_ticks();
+    }
+
     if (nca_header->fs_headers[section_index].crypt_type == CRYPT_BKTR)
     {
         nca_encrypt_bktr_section(nca_file, nca_header, section_index, settings);
-        return;
     }
-
-    uint64_t start_offset = nca_header->section_entries[section_index].media_start_offset;
-    start_offset *= 0x200;
-    uint64_t end_offset = nca_header->section_entries[section_index].media_end_offset;
-    end_offset *= 0x200;
-    uint64_t filesize = end_offset - start_offset;
-
-    // Calculate counter for section encryption
-    uint64_t ctr_ofs = start_offset >> 4;
-    unsigned char ctr[0x10] = {0};
-    for (unsigned int j = 0; j < 0x8; j++)
-    {
-        ctr[j] = nca_header->fs_headers[section_index].section_ctr[0x8 - j - 1];
-        ctr[0x10 - j - 1] = (unsigned char)(ctr_ofs & 0xFF);
-        ctr_ofs >>= 8;
-    }
-
-    uint64_t read_size = 0x6000000; //~100 MB buffer.
-    unsigned char *buf = malloc(read_size);
-    if (buf == NULL)
-    {
-        fprintf(stderr, "Failed to allocate file-read buffer!\n");
-        exit(EXIT_FAILURE);
-    }
-
-    // Set Section encryption key
-    unsigned char enc_key[0x10];
-    if (settings->has_title_key == 1)
-        memcpy(enc_key, settings->title_key, 0x10);
     else
-        memcpy(enc_key, nca_header->encrypted_keys[2], 0x10);
-    aes_ctx_t *aes_ctx = new_aes_ctx(enc_key, 16, AES_MODE_CTR);
-
-    uint64_t ofs = 0;
-    fseeko64(nca_file, start_offset, SEEK_SET);
-    while (ofs < filesize)
     {
-        if (ofs + read_size >= filesize)
-            read_size = filesize - ofs;
-        if (fread(buf, 1, read_size, nca_file) != read_size)
+        uint64_t start_offset = nca_header->section_entries[section_index].media_start_offset;
+        start_offset *= 0x200;
+        uint64_t end_offset = nca_header->section_entries[section_index].media_end_offset;
+        end_offset *= 0x200;
+        uint64_t filesize = end_offset - start_offset;
+
+        // Calculate counter for section encryption
+        uint64_t ctr_ofs = start_offset >> 4;
+        unsigned char ctr[0x10] = {0};
+        for (unsigned int j = 0; j < 0x8; j++)
         {
-            fprintf(stderr, "Failed to read file!\n");
+            ctr[j] = nca_header->fs_headers[section_index].section_ctr[0x8 - j - 1];
+            ctr[0x10 - j - 1] = (unsigned char)(ctr_ofs & 0xFF);
+            ctr_ofs >>= 8;
+        }
+
+        uint64_t read_size = 0x6000000; //~100 MB buffer.
+        unsigned char *buf = malloc(read_size);
+        if (buf == NULL)
+        {
+            fprintf(stderr, "Failed to allocate file-read buffer!\n");
             exit(EXIT_FAILURE);
         }
-        fseeko64(nca_file, start_offset + ofs, SEEK_SET);
-        aes_setiv(aes_ctx, ctr, 0x10);
-        aes_encrypt(aes_ctx, buf, buf, read_size);
-        fwrite(buf, 1, read_size, nca_file);
-        ofs += read_size;
-        nca_update_ctr(ctr, start_offset + ofs);
+
+        // Set Section encryption key
+        unsigned char enc_key[0x10];
+        if (settings->has_title_key == 1)
+            memcpy(enc_key, settings->title_key, 0x10);
+        else
+            memcpy(enc_key, nca_header->encrypted_keys[2], 0x10);
+        aes_ctx_t *aes_ctx = new_aes_ctx(enc_key, 16, AES_MODE_CTR);
+
+        uint64_t ofs = 0;
+        fseeko64(nca_file, start_offset, SEEK_SET);
+        while (ofs < filesize)
+        {
+            if (ofs + read_size >= filesize)
+                read_size = filesize - ofs;
+            if (fread(buf, 1, read_size, nca_file) != read_size)
+            {
+                fprintf(stderr, "Failed to read file!\n");
+                exit(EXIT_FAILURE);
+            }
+            fseeko64(nca_file, start_offset + ofs, SEEK_SET);
+            aes_setiv(aes_ctx, ctr, 0x10);
+            aes_encrypt(aes_ctx, buf, buf, read_size);
+            fwrite(buf, 1, read_size, nca_file);
+            ofs += read_size;
+            nca_update_ctr(ctr, start_offset + ofs);
+        }
+
+        free(buf);
+        free_aes_ctx(aes_ctx);
     }
 
-    free(buf);
-    free_aes_ctx(aes_ctx);
+    if (settings->profile)
+    {
+        nca_profile_add(&settings->profile_encrypt_ms, profile_start);
+    }
 }
 
 /* Updates the CTR for an offset. */
@@ -2279,6 +2730,23 @@ void nca_update_ctr(unsigned char *ctr, uint64_t ofs)
         ctr[0x10 - j - 1] = (unsigned char)(ofs & 0xFF);
         ofs >>= 8;
     }
+}
+
+void nca_print_profile(const hp_settings_t *settings)
+{
+    if (!settings->profile)
+    {
+        return;
+    }
+
+    printf("\n----> Profile:\n");
+    printf("romfs_current:  %.3f ms\n", settings->profile_romfs_current_ms);
+    printf("romfs_base:     %.3f ms\n", settings->profile_romfs_base_ms);
+    printf("layout_current: %.3f ms\n", settings->profile_layout_current_ms);
+    printf("layout_base:    %.3f ms\n", settings->profile_layout_base_ms);
+    printf("patch_hints:    %.3f ms\n", settings->profile_patch_hints_ms);
+    printf("patch_diff:     %.3f ms\n", settings->profile_patch_diff_ms);
+    printf("encrypt:        %.3f ms\n", settings->profile_encrypt_ms);
 }
 
 void nca_calculate_hash(FILE *nca_file, unsigned char *out_nca_hash)

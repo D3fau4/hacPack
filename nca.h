@@ -114,5 +114,6 @@ void nca_update_ctr(unsigned char *ctr, uint64_t ofs);
 void nca_set_keygen(nca_header_t *nca_header, hp_settings_t *settings);
 void nca_generate_sig(uint8_t *nca_sig, hp_settings_t *settings);
 char *nca_romfs_get_type(uint8_t type);
+void nca_print_profile(const hp_settings_t *settings);
 
 #endif

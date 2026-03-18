@@ -35,6 +35,7 @@ static void usage(void)
             "--plaintext              Skip encrypting sections and set section header block crypto type to plaintext\n"
             "--patch                  Build RomFS sections as BKTR patch sections\n"
             "--baseromfsdir           Set base RomFS directory used to build delta/patch data\n"
+            "--profile                Print per-phase timings for patch generation\n"
             "--sdkversion             Set SDK version in hex, default SDK version is 000C1100\n"
             "--keyareakey             Set key area key 2 in hex with 16 bytes length\n"
             "--ncasig                 Set nca signature type [zero, static, random]. Default is zero\n"
@@ -164,6 +165,7 @@ int main(int argc, char **argv)
                 {"ncasig2modulus", 1, NULL, 32},
                 {"patch", 0, NULL, 33},
                 {"baseromfsdir", 1, NULL, 34},
+                {"profile", 0, NULL, 35},
                 {NULL, 0, NULL, 0},
             };
 
@@ -355,6 +357,9 @@ int main(int argc, char **argv)
         case 34:
             filepath_set(&settings.base_romfs_dir, optarg);
             break;
+        case 35:
+            settings.profile = 1;
+            break;
         default:
             usage();
         }
@@ -494,6 +499,13 @@ int main(int argc, char **argv)
 
     if (settings.file_type == FILE_TYPE_NCA)
     {
+        if (settings.create_patch &&
+            ((settings.romfs_dir.valid == VALIDITY_VALID && strncmp(settings.romfs_dir.char_path, "/mnt/", 5) == 0) ||
+             (settings.base_romfs_dir.valid == VALIDITY_VALID && strncmp(settings.base_romfs_dir.char_path, "/mnt/", 5) == 0)))
+        {
+            printf("Warning: patch inputs under /mnt/ on WSL can be significantly slower due to extra file-system overhead\n");
+        }
+
         if (settings.create_patch && settings.plaintext)
         {
             fprintf(stderr, "Error: --patch is not compatible with --plaintext\n");
@@ -652,6 +664,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "Error: --type is not set\n");
         usage();
     }
+
+    nca_print_profile(&settings);
 
     // Remove temp directory
     if (settings.file_type == FILE_TYPE_NCA)

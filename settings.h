@@ -115,10 +115,18 @@ typedef struct
     filepath_t nca_sig2_modulus;
     uint8_t plaintext;
     uint8_t create_patch;
+    uint8_t profile;
     uint8_t digest[0x20];
     uint32_t title_version;
     uint8_t has_title_key;
     uint8_t noselfsignncasig2;
+    double profile_romfs_current_ms;
+    double profile_romfs_base_ms;
+    double profile_layout_current_ms;
+    double profile_layout_base_ms;
+    double profile_patch_hints_ms;
+    double profile_patch_diff_ms;
+    double profile_encrypt_ms;
     unsigned char title_key[0x10];
     unsigned char *keyareakey;
     int keygeneration;

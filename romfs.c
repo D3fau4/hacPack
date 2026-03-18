@@ -87,12 +87,220 @@ static void romfs_free_file_list(romfs_fent_ctx_t *files)
     }
 }
 
+static void romfs_free_ctx_arrays(romfs_ctx_t *romfs_ctx)
+{
+    free(romfs_ctx->dir_entries);
+    free(romfs_ctx->file_entries);
+    romfs_ctx->dir_entries = NULL;
+    romfs_ctx->file_entries = NULL;
+    romfs_ctx->dir_capacity = 0;
+    romfs_ctx->file_capacity = 0;
+}
+
+static void romfs_append_dir_entry(romfs_ctx_t *romfs_ctx, romfs_dirent_ctx_t *entry)
+{
+    if (romfs_ctx->num_dirs >= romfs_ctx->dir_capacity)
+    {
+        uint64_t new_capacity = (romfs_ctx->dir_capacity == 0) ? 32 : (romfs_ctx->dir_capacity * 2);
+        romfs_dirent_ctx_t **new_entries = realloc(romfs_ctx->dir_entries, (size_t)new_capacity * sizeof(*new_entries));
+        if (new_entries == NULL)
+        {
+            fprintf(stderr, "Failed to grow RomFS directory entry list!\n");
+            exit(EXIT_FAILURE);
+        }
+
+        romfs_ctx->dir_entries = new_entries;
+        romfs_ctx->dir_capacity = new_capacity;
+    }
+
+    romfs_ctx->dir_entries[romfs_ctx->num_dirs++] = entry;
+}
+
+static void romfs_append_file_entry(romfs_ctx_t *romfs_ctx, romfs_fent_ctx_t *entry)
+{
+    if (romfs_ctx->num_files >= romfs_ctx->file_capacity)
+    {
+        uint64_t new_capacity = (romfs_ctx->file_capacity == 0) ? 32 : (romfs_ctx->file_capacity * 2);
+        romfs_fent_ctx_t **new_entries = realloc(romfs_ctx->file_entries, (size_t)new_capacity * sizeof(*new_entries));
+        if (new_entries == NULL)
+        {
+            fprintf(stderr, "Failed to grow RomFS file entry list!\n");
+            exit(EXIT_FAILURE);
+        }
+
+        romfs_ctx->file_entries = new_entries;
+        romfs_ctx->file_capacity = new_capacity;
+    }
+
+    romfs_ctx->file_entries[romfs_ctx->num_files++] = entry;
+}
+
+static int romfs_compare_dir_nodes(const void *left, const void *right)
+{
+    const romfs_dirent_ctx_t *left_dir = *(const romfs_dirent_ctx_t * const *)left;
+    const romfs_dirent_ctx_t *right_dir = *(const romfs_dirent_ctx_t * const *)right;
+    return strcmp(left_dir->sum_path.char_path, right_dir->sum_path.char_path);
+}
+
+static int romfs_compare_file_nodes(const void *left, const void *right)
+{
+    const romfs_fent_ctx_t *left_file = *(const romfs_fent_ctx_t * const *)left;
+    const romfs_fent_ctx_t *right_file = *(const romfs_fent_ctx_t * const *)right;
+    return strcmp(left_file->sum_path.char_path, right_file->sum_path.char_path);
+}
+
+static void romfs_finalize_ctx(romfs_dirent_ctx_t *root_ctx, romfs_ctx_t *romfs_ctx)
+{
+    uint32_t file_entry_offset = 0;
+    uint32_t dir_entry_offset = 0;
+
+    if (romfs_ctx->num_dirs > 1)
+    {
+        qsort(romfs_ctx->dir_entries + 1, (size_t)(romfs_ctx->num_dirs - 1), sizeof(*romfs_ctx->dir_entries), romfs_compare_dir_nodes);
+    }
+    if (romfs_ctx->num_files > 1)
+    {
+        qsort(romfs_ctx->file_entries, (size_t)romfs_ctx->num_files, sizeof(*romfs_ctx->file_entries), romfs_compare_file_nodes);
+    }
+
+    for (uint64_t i = 0; i < romfs_ctx->num_dirs; i++)
+    {
+        romfs_dirent_ctx_t *dir = romfs_ctx->dir_entries[i];
+        dir->sort_index = (uint32_t)i;
+        dir->child = NULL;
+        dir->file = NULL;
+        dir->sibling = NULL;
+        dir->next = (i + 1 < romfs_ctx->num_dirs) ? romfs_ctx->dir_entries[i + 1] : NULL;
+    }
+
+    romfs_ctx->files = NULL;
+    for (uint64_t i = 0; i < romfs_ctx->num_files; i++)
+    {
+        romfs_fent_ctx_t *file = romfs_ctx->file_entries[i];
+        file->sort_index = (uint32_t)i;
+        file->sibling = NULL;
+        file->next = (i + 1 < romfs_ctx->num_files) ? romfs_ctx->file_entries[i + 1] : NULL;
+        if (i == 0)
+        {
+            romfs_ctx->files = file;
+        }
+    }
+
+    if (romfs_ctx->num_dirs > 0)
+    {
+        romfs_dirent_ctx_t **last_dir_child = calloc((size_t)romfs_ctx->num_dirs, sizeof(*last_dir_child));
+        romfs_fent_ctx_t **last_file_child = calloc((size_t)romfs_ctx->num_dirs, sizeof(*last_file_child));
+        if (last_dir_child == NULL || last_file_child == NULL)
+        {
+            free(last_dir_child);
+            free(last_file_child);
+            fprintf(stderr, "Failed to allocate RomFS relationship buffers!\n");
+            exit(EXIT_FAILURE);
+        }
+
+        for (uint64_t i = 1; i < romfs_ctx->num_dirs; i++)
+        {
+            romfs_dirent_ctx_t *dir = romfs_ctx->dir_entries[i];
+            uint32_t parent_index = dir->parent->sort_index;
+            if (dir->parent->child == NULL)
+            {
+                dir->parent->child = dir;
+            }
+            else
+            {
+                last_dir_child[parent_index]->sibling = dir;
+            }
+            last_dir_child[parent_index] = dir;
+        }
+
+        for (uint64_t i = 0; i < romfs_ctx->num_files; i++)
+        {
+            romfs_fent_ctx_t *file = romfs_ctx->file_entries[i];
+            uint32_t parent_index = file->parent->sort_index;
+            if (file->parent->file == NULL)
+            {
+                file->parent->file = file;
+            }
+            else
+            {
+                last_file_child[parent_index]->sibling = file;
+            }
+            last_file_child[parent_index] = file;
+        }
+
+        free(last_dir_child);
+        free(last_file_child);
+    }
+
+    printf("Calculating metadata\n");
+    romfs_ctx->file_partition_size = 0;
+    for (uint64_t i = 0; i < romfs_ctx->num_files; i++)
+    {
+        romfs_fent_ctx_t *cur_file = romfs_ctx->file_entries[i];
+        romfs_ctx->file_partition_size = align64(romfs_ctx->file_partition_size, 0x10);
+        cur_file->offset = romfs_ctx->file_partition_size;
+        cur_file->entry_offset = file_entry_offset;
+        romfs_ctx->file_partition_size += cur_file->size;
+        file_entry_offset += 0x20 + align(strlen(cur_file->cur_path.char_path) - 1, 4);
+    }
+
+    for (uint64_t i = 0; i < romfs_ctx->num_dirs; i++)
+    {
+        romfs_dirent_ctx_t *cur_dir = romfs_ctx->dir_entries[i];
+        cur_dir->entry_offset = dir_entry_offset;
+        if (cur_dir == root_ctx)
+        {
+            dir_entry_offset += 0x18;
+        }
+        else
+        {
+            dir_entry_offset += 0x18 + align(strlen(cur_dir->cur_path.char_path) - 1, 4);
+        }
+    }
+}
+
+static void romfs_export_file_layout(const filepath_t *in_dirpath, const romfs_ctx_t *romfs_ctx, romfs_layout_t *out_layout)
+{
+    size_t root_len = strlen(in_dirpath->char_path);
+
+    out_layout->entries = NULL;
+    out_layout->entry_count = 0;
+    if (romfs_ctx->num_files == 0)
+    {
+        return;
+    }
+
+    out_layout->entries = calloc((size_t)romfs_ctx->num_files, sizeof(*out_layout->entries));
+    if (out_layout->entries == NULL)
+    {
+        fprintf(stderr, "Failed to allocate RomFS file layout entries!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    for (uint64_t i = 0; i < romfs_ctx->num_files; i++)
+    {
+        romfs_fent_ctx_t *cur_file = romfs_ctx->file_entries[i];
+        const char *relative_path = cur_file->sum_path.char_path + root_len;
+
+        out_layout->entries[i].path = strdup(relative_path);
+        filepath_init(&out_layout->entries[i].source_path);
+        filepath_copy(&out_layout->entries[i].source_path, &cur_file->sum_path);
+        out_layout->entries[i].offset = cur_file->offset + ROMFS_FILEPARTITION_OFS;
+        out_layout->entries[i].size = cur_file->size;
+        if (out_layout->entries[i].path == NULL)
+        {
+            romfs_free_file_layout(out_layout->entries, (uint32_t)i);
+            fprintf(stderr, "Failed to duplicate RomFS file layout path!\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    out_layout->entry_count = (uint32_t)romfs_ctx->num_files;
+}
+
 static romfs_dirent_ctx_t *romfs_prepare_ctx(filepath_t *in_dirpath, romfs_ctx_t *romfs_ctx, uint32_t *out_dir_hash_table_entry_count, uint32_t *out_file_hash_table_entry_count)
 {
     romfs_dirent_ctx_t *root_ctx = calloc(1, sizeof(romfs_dirent_ctx_t));
-    romfs_fent_ctx_t *cur_file = NULL;
-    romfs_dirent_ctx_t *cur_dir = NULL;
-    uint32_t entry_offset = 0;
 
     if (root_ctx == NULL)
     {
@@ -100,49 +308,23 @@ static romfs_dirent_ctx_t *romfs_prepare_ctx(filepath_t *in_dirpath, romfs_ctx_t
         exit(EXIT_FAILURE);
     }
 
-    root_ctx->parent = root_ctx;
     memset(romfs_ctx, 0, sizeof(*romfs_ctx));
+    root_ctx->parent = root_ctx;
 
     filepath_copy(&root_ctx->sum_path, in_dirpath);
     filepath_init(&root_ctx->cur_path);
     filepath_set(&root_ctx->cur_path, "");
     romfs_ctx->dir_table_size = 0x18;
-    romfs_ctx->num_dirs = 1;
+    romfs_append_dir_entry(romfs_ctx, root_ctx);
 
     printf("Visiting directories\n");
     romfs_visit_dir(root_ctx, romfs_ctx);
-    *out_dir_hash_table_entry_count = romfs_get_hash_table_count(romfs_ctx->num_dirs);
-    *out_file_hash_table_entry_count = romfs_get_hash_table_count(romfs_ctx->num_files);
+    romfs_finalize_ctx(root_ctx, romfs_ctx);
+
+    *out_dir_hash_table_entry_count = romfs_get_hash_table_count((uint32_t)romfs_ctx->num_dirs);
+    *out_file_hash_table_entry_count = romfs_get_hash_table_count((uint32_t)romfs_ctx->num_files);
     romfs_ctx->dir_hash_table_size = 4 * (*out_dir_hash_table_entry_count);
     romfs_ctx->file_hash_table_size = 4 * (*out_file_hash_table_entry_count);
-
-    printf("Calculating metadata\n");
-    cur_file = romfs_ctx->files;
-    while (cur_file != NULL)
-    {
-        romfs_ctx->file_partition_size = align64(romfs_ctx->file_partition_size, 0x10);
-        cur_file->offset = romfs_ctx->file_partition_size;
-        cur_file->entry_offset = entry_offset;
-        romfs_ctx->file_partition_size += cur_file->size;
-        entry_offset += 0x20 + align(strlen(cur_file->cur_path.char_path) - 1, 4);
-        cur_file = cur_file->next;
-    }
-
-    cur_dir = root_ctx;
-    entry_offset = 0;
-    while (cur_dir != NULL)
-    {
-        cur_dir->entry_offset = entry_offset;
-        if (cur_dir == root_ctx)
-        {
-            entry_offset += 0x18;
-        }
-        else
-        {
-            entry_offset += 0x18 + align(strlen(cur_dir->cur_path.char_path) - 1, 4);
-        }
-        cur_dir = cur_dir->next;
-    }
 
     return root_ctx;
 }
@@ -151,8 +333,6 @@ void romfs_visit_dir(romfs_dirent_ctx_t *parent, romfs_ctx_t *romfs_ctx)
 {
     osdir_t *dir = NULL;
     osdirent_t *cur_dirent = NULL;
-    romfs_dirent_ctx_t *child_dir_tree = NULL;
-    romfs_fent_ctx_t *child_file_tree = NULL;
     romfs_dirent_ctx_t *cur_dir = NULL;
     romfs_fent_ctx_t *cur_file = NULL;
     filepath_t cur_path;
@@ -196,53 +376,13 @@ void romfs_visit_dir(romfs_dirent_ctx_t *parent, romfs_ctx_t *romfs_ctx)
                 exit(EXIT_FAILURE);
             }
 
-            romfs_ctx->num_dirs++;
-
             cur_dir->parent = parent;
             filepath_copy(&cur_dir->sum_path, &cur_sum_path);
             filepath_copy(&cur_dir->cur_path, &cur_path);
-
             romfs_ctx->dir_table_size += 0x18 + align(strlen(cur_dir->cur_path.char_path) - 1, 4);
-
-            /* Ordered insertion on sibling */
-            if (child_dir_tree == NULL || strcmp(cur_dir->sum_path.char_path, child_dir_tree->sum_path.char_path) < 0)
-            {
-                cur_dir->sibling = child_dir_tree;
-                child_dir_tree = cur_dir;
-            }
-            else
-            {
-                romfs_dirent_ctx_t *child, *prev;
-                prev = child_dir_tree;
-                child = child_dir_tree->sibling;
-                while (child != NULL)
-                {
-                    if (strcmp(cur_dir->sum_path.char_path, child->sum_path.char_path) < 0)
-                    {
-                        break;
-                    }
-                    prev = child;
-                    child = child->sibling;
-                }
-
-                prev->sibling = cur_dir;
-                cur_dir->sibling = child;
-            }
-
-            /* Ordered insertion on next */
-            romfs_dirent_ctx_t *tmp = parent->next, *tmp_prev = parent;
-            while (tmp != NULL)
-            {
-                if (strcmp(cur_dir->sum_path.char_path, tmp->sum_path.char_path) < 0)
-                {
-                    break;
-                }
-                tmp_prev = tmp;
-                tmp = tmp->next;
-            }
-            tmp_prev->next = cur_dir;
-            cur_dir->next = tmp;
-
+            cur_dir->sibling = parent->child;
+            parent->child = cur_dir;
+            romfs_append_dir_entry(romfs_ctx, cur_dir);
             cur_dir = NULL;
         }
         else if ((cur_stats.st_mode & S_IFMT) == S_IFREG)
@@ -254,65 +394,14 @@ void romfs_visit_dir(romfs_dirent_ctx_t *parent, romfs_ctx_t *romfs_ctx)
                 exit(EXIT_FAILURE);
             }
 
-            romfs_ctx->num_files++;
-
             cur_file->parent = parent;
             filepath_copy(&cur_file->sum_path, &cur_sum_path);
             filepath_copy(&cur_file->cur_path, &cur_path);
             cur_file->size = cur_stats.st_size;
-
             romfs_ctx->file_table_size += 0x20 + align(strlen(cur_file->cur_path.char_path) - 1, 4);
-
-            /* Ordered insertion on sibling */
-            if (child_file_tree == NULL || strcmp(cur_file->sum_path.char_path, child_file_tree->sum_path.char_path) < 0)
-            {
-                cur_file->sibling = child_file_tree;
-                child_file_tree = cur_file;
-            }
-            else
-            {
-                romfs_fent_ctx_t *child, *prev;
-                prev = child_file_tree;
-                child = child_file_tree->sibling;
-                while (child != NULL)
-                {
-                    if (strcmp(cur_file->sum_path.char_path, child->sum_path.char_path) < 0)
-                    {
-                        break;
-                    }
-                    prev = child;
-                    child = child->sibling;
-                }
-
-                prev->sibling = cur_file;
-                cur_file->sibling = child;
-            }
-
-            /* Ordered insertion on next */
-            if (romfs_ctx->files == NULL || strcmp(cur_file->sum_path.char_path, romfs_ctx->files->sum_path.char_path) < 0)
-            {
-                cur_file->next = romfs_ctx->files;
-                romfs_ctx->files = cur_file;
-            }
-            else
-            {
-                romfs_fent_ctx_t *child, *prev;
-                prev = romfs_ctx->files;
-                child = romfs_ctx->files->next;
-                while (child != NULL)
-                {
-                    if (strcmp(cur_file->sum_path.char_path, child->sum_path.char_path) < 0)
-                    {
-                        break;
-                    }
-                    prev = child;
-                    child = child->next;
-                }
-
-                prev->next = cur_file;
-                cur_file->next = child;
-            }
-
+            cur_file->sibling = parent->file;
+            parent->file = cur_file;
+            romfs_append_file_entry(romfs_ctx, cur_file);
             cur_file = NULL;
         }
         else
@@ -323,10 +412,7 @@ void romfs_visit_dir(romfs_dirent_ctx_t *parent, romfs_ctx_t *romfs_ctx)
     }
 
     os_closedir(dir);
-    parent->child = child_dir_tree;
-    parent->file = child_file_tree;
-
-    cur_dir = child_dir_tree;
+    cur_dir = parent->child;
     while (cur_dir != NULL)
     {
         romfs_visit_dir(cur_dir, romfs_ctx);
@@ -334,7 +420,7 @@ void romfs_visit_dir(romfs_dirent_ctx_t *parent, romfs_ctx_t *romfs_ctx)
     }
 }
 
-size_t build_romfs_into_file(filepath_t *in_dirpath, FILE *f_out, off_t base_offset, filepath_t *out_romfspath)
+static size_t build_romfs_into_file(filepath_t *in_dirpath, FILE *f_out, off_t base_offset, filepath_t *out_romfspath, romfs_build_result_t *out_result)
 {
     romfs_ctx_t romfs_ctx;
     uint32_t dir_hash_table_entry_count = 0;
@@ -525,8 +611,16 @@ size_t build_romfs_into_file(filepath_t *in_dirpath, FILE *f_out, off_t base_off
     }
     free(file_table);
 
+    if (out_result != NULL)
+    {
+        memset(out_result, 0, sizeof(*out_result));
+        out_result->image_size = dir_hash_table_ofs + romfs_ctx.dir_hash_table_size + romfs_ctx.dir_table_size + romfs_ctx.file_hash_table_size + romfs_ctx.file_table_size;
+        romfs_export_file_layout(in_dirpath, &romfs_ctx, &out_result->layout);
+    }
+
     romfs_free_dir_list(root_ctx);
     romfs_free_file_list(romfs_ctx.files);
+    romfs_free_ctx_arrays(&romfs_ctx);
 
     return dir_hash_table_ofs + romfs_ctx.dir_hash_table_size + romfs_ctx.dir_table_size + romfs_ctx.file_hash_table_size + romfs_ctx.file_table_size;
 }
@@ -541,7 +635,7 @@ size_t romfs_build(filepath_t *in_dirpath, filepath_t *out_romfspath, uint64_t *
         exit(EXIT_FAILURE);
     }
 
-    size_t sz = build_romfs_into_file(in_dirpath, f_out, 0, out_romfspath);
+    size_t sz = build_romfs_into_file(in_dirpath, f_out, 0, out_romfspath, NULL);
 
     // Write Padding
     fseeko64(f_out, 0, SEEK_END);
@@ -560,61 +654,66 @@ size_t romfs_build(filepath_t *in_dirpath, filepath_t *out_romfspath, uint64_t *
     return sz;
 }
 
+size_t romfs_build_with_layout(filepath_t *in_dirpath, filepath_t *out_romfspath, romfs_build_result_t *out_result)
+{
+    FILE *f_out = NULL;
+    size_t sz;
+
+    if (out_result == NULL)
+    {
+        fprintf(stderr, "romfs_build_with_layout requires an output result buffer\n");
+        exit(EXIT_FAILURE);
+    }
+
+    if ((f_out = os_fopen(out_romfspath->os_path, OS_MODE_WRITE)) == NULL)
+    {
+        fprintf(stderr, "Failed to open %s!\n", out_romfspath->char_path);
+        exit(EXIT_FAILURE);
+    }
+
+    sz = build_romfs_into_file(in_dirpath, f_out, 0, out_romfspath, out_result);
+
+    fseeko64(f_out, 0, SEEK_END);
+    out_result->image_size = (uint64_t)ftello64(f_out);
+    {
+        uint64_t hash_block_size = IVFC_HASH_BLOCK_SIZE;
+        uint64_t curr_offset = (uint64_t)ftello64(f_out);
+        uint64_t padding_size = hash_block_size - (curr_offset % hash_block_size);
+        if (padding_size != 0)
+        {
+            unsigned char *padding_buf = (unsigned char *)calloc(1, padding_size);
+            fwrite(padding_buf, 1, padding_size, f_out);
+            free(padding_buf);
+            out_result->image_size = curr_offset + padding_size;
+        }
+    }
+
+    fclose(f_out);
+    return sz;
+}
+
 void romfs_collect_file_layout(filepath_t *in_dirpath, romfs_file_layout_entry_t **out_entries, uint32_t *out_entry_count)
 {
     romfs_ctx_t romfs_ctx;
     uint32_t dir_hash_table_entry_count = 0;
     uint32_t file_hash_table_entry_count = 0;
     romfs_dirent_ctx_t *root_ctx = romfs_prepare_ctx(in_dirpath, &romfs_ctx, &dir_hash_table_entry_count, &file_hash_table_entry_count);
-    romfs_file_layout_entry_t *entries = NULL;
-    romfs_fent_ctx_t *cur_file = romfs_ctx.files;
-    uint32_t index = 0;
-    size_t root_len = strlen(in_dirpath->char_path);
+    romfs_layout_t layout;
 
     (void)dir_hash_table_entry_count;
     (void)file_hash_table_entry_count;
 
     *out_entries = NULL;
     *out_entry_count = 0;
-
-    if (romfs_ctx.num_files > 0)
-    {
-        entries = calloc((size_t)romfs_ctx.num_files, sizeof(*entries));
-        if (entries == NULL)
-        {
-            romfs_free_dir_list(root_ctx);
-            romfs_free_file_list(romfs_ctx.files);
-            fprintf(stderr, "Failed to allocate RomFS file layout entries!\n");
-            exit(EXIT_FAILURE);
-        }
-    }
-
-    while (cur_file != NULL)
-    {
-        const char *relative_path = cur_file->sum_path.char_path + root_len;
-        entries[index].path = strdup(relative_path);
-        filepath_init(&entries[index].source_path);
-        filepath_copy(&entries[index].source_path, &cur_file->sum_path);
-        entries[index].offset = cur_file->offset + ROMFS_FILEPARTITION_OFS;
-        entries[index].size = cur_file->size;
-        if (entries[index].path == NULL)
-        {
-            romfs_free_file_layout(entries, index);
-            romfs_free_dir_list(root_ctx);
-            romfs_free_file_list(romfs_ctx.files);
-            fprintf(stderr, "Failed to duplicate RomFS file layout path!\n");
-            exit(EXIT_FAILURE);
-        }
-
-        index++;
-        cur_file = cur_file->next;
-    }
+    memset(&layout, 0, sizeof(layout));
+    romfs_export_file_layout(in_dirpath, &romfs_ctx, &layout);
 
     romfs_free_dir_list(root_ctx);
     romfs_free_file_list(romfs_ctx.files);
+    romfs_free_ctx_arrays(&romfs_ctx);
 
-    *out_entries = entries;
-    *out_entry_count = index;
+    *out_entries = layout.entries;
+    *out_entry_count = layout.entry_count;
 }
 
 void romfs_free_file_layout(romfs_file_layout_entry_t *entries, uint32_t entry_count)
@@ -630,4 +729,15 @@ void romfs_free_file_layout(romfs_file_layout_entry_t *entries, uint32_t entry_c
     }
 
     free(entries);
+}
+
+void romfs_free_build_result(romfs_build_result_t *result)
+{
+    if (result == NULL)
+    {
+        return;
+    }
+
+    romfs_free_file_layout(result->layout.entries, result->layout.entry_count);
+    memset(result, 0, sizeof(*result));
 }
