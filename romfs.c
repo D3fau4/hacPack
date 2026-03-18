@@ -11,6 +11,8 @@
 #define ROMFS_ENTRY_EMPTY 0xFFFFFFFF
 #define ROMFS_FILEPARTITION_OFS 0x200
 
+void romfs_visit_dir(romfs_dirent_ctx_t *parent, romfs_ctx_t *romfs_ctx);
+
 romfs_direntry_t *romfs_get_direntry(romfs_direntry_t *directories, uint32_t offset)
 {
     return (romfs_direntry_t *)((char *)directories + offset);
@@ -63,6 +65,86 @@ uint32_t romfs_get_hash_table_count(uint32_t num_entries)
         count++;
     }
     return count;
+}
+
+static void romfs_free_dir_list(romfs_dirent_ctx_t *root_ctx)
+{
+    while (root_ctx != NULL)
+    {
+        romfs_dirent_ctx_t *next = root_ctx->next;
+        free(root_ctx);
+        root_ctx = next;
+    }
+}
+
+static void romfs_free_file_list(romfs_fent_ctx_t *files)
+{
+    while (files != NULL)
+    {
+        romfs_fent_ctx_t *next = files->next;
+        free(files);
+        files = next;
+    }
+}
+
+static romfs_dirent_ctx_t *romfs_prepare_ctx(filepath_t *in_dirpath, romfs_ctx_t *romfs_ctx, uint32_t *out_dir_hash_table_entry_count, uint32_t *out_file_hash_table_entry_count)
+{
+    romfs_dirent_ctx_t *root_ctx = calloc(1, sizeof(romfs_dirent_ctx_t));
+    romfs_fent_ctx_t *cur_file = NULL;
+    romfs_dirent_ctx_t *cur_dir = NULL;
+    uint32_t entry_offset = 0;
+
+    if (root_ctx == NULL)
+    {
+        fprintf(stderr, "Failed to allocate root context!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    root_ctx->parent = root_ctx;
+    memset(romfs_ctx, 0, sizeof(*romfs_ctx));
+
+    filepath_copy(&root_ctx->sum_path, in_dirpath);
+    filepath_init(&root_ctx->cur_path);
+    filepath_set(&root_ctx->cur_path, "");
+    romfs_ctx->dir_table_size = 0x18;
+    romfs_ctx->num_dirs = 1;
+
+    printf("Visiting directories\n");
+    romfs_visit_dir(root_ctx, romfs_ctx);
+    *out_dir_hash_table_entry_count = romfs_get_hash_table_count(romfs_ctx->num_dirs);
+    *out_file_hash_table_entry_count = romfs_get_hash_table_count(romfs_ctx->num_files);
+    romfs_ctx->dir_hash_table_size = 4 * (*out_dir_hash_table_entry_count);
+    romfs_ctx->file_hash_table_size = 4 * (*out_file_hash_table_entry_count);
+
+    printf("Calculating metadata\n");
+    cur_file = romfs_ctx->files;
+    while (cur_file != NULL)
+    {
+        romfs_ctx->file_partition_size = align64(romfs_ctx->file_partition_size, 0x10);
+        cur_file->offset = romfs_ctx->file_partition_size;
+        cur_file->entry_offset = entry_offset;
+        romfs_ctx->file_partition_size += cur_file->size;
+        entry_offset += 0x20 + align(strlen(cur_file->cur_path.char_path) - 1, 4);
+        cur_file = cur_file->next;
+    }
+
+    cur_dir = root_ctx;
+    entry_offset = 0;
+    while (cur_dir != NULL)
+    {
+        cur_dir->entry_offset = entry_offset;
+        if (cur_dir == root_ctx)
+        {
+            entry_offset += 0x18;
+        }
+        else
+        {
+            entry_offset += 0x18 + align(strlen(cur_dir->cur_path.char_path) - 1, 4);
+        }
+        cur_dir = cur_dir->next;
+    }
+
+    return root_ctx;
 }
 
 void romfs_visit_dir(romfs_dirent_ctx_t *parent, romfs_ctx_t *romfs_ctx)
@@ -254,37 +336,15 @@ void romfs_visit_dir(romfs_dirent_ctx_t *parent, romfs_ctx_t *romfs_ctx)
 
 size_t build_romfs_into_file(filepath_t *in_dirpath, FILE *f_out, off_t base_offset, filepath_t *out_romfspath)
 {
-    romfs_dirent_ctx_t *root_ctx = calloc(1, sizeof(romfs_dirent_ctx_t));
-    if (root_ctx == NULL)
-    {
-        fprintf(stderr, "Failed to allocate root context!\n");
-        exit(EXIT_FAILURE);
-    }
-
-    root_ctx->parent = root_ctx;
-
     romfs_ctx_t romfs_ctx;
-    memset(&romfs_ctx, 0, sizeof(romfs_ctx));
-
-    filepath_copy(&root_ctx->sum_path, in_dirpath);
-    filepath_init(&root_ctx->cur_path);
-    filepath_set(&root_ctx->cur_path, "");
-    romfs_ctx.dir_table_size = 0x18; /* Root directory. */
-    romfs_ctx.num_dirs = 1;
-
-    /* Visit all directories. */
-    printf("Visiting directories\n");
-    romfs_visit_dir(root_ctx, &romfs_ctx);
-    uint32_t dir_hash_table_entry_count = romfs_get_hash_table_count(romfs_ctx.num_dirs);
-    uint32_t file_hash_table_entry_count = romfs_get_hash_table_count(romfs_ctx.num_files);
-    romfs_ctx.dir_hash_table_size = 4 * dir_hash_table_entry_count;
-    romfs_ctx.file_hash_table_size = 4 * file_hash_table_entry_count;
+    uint32_t dir_hash_table_entry_count = 0;
+    uint32_t file_hash_table_entry_count = 0;
+    romfs_dirent_ctx_t *root_ctx = romfs_prepare_ctx(in_dirpath, &romfs_ctx, &dir_hash_table_entry_count, &file_hash_table_entry_count);
 
     romfs_header_t header;
     memset(&header, 0, sizeof(header));
     romfs_fent_ctx_t *cur_file = NULL;
     romfs_dirent_ctx_t *cur_dir = NULL;
-    uint32_t entry_offset = 0;
 
     uint32_t *dir_hash_table = malloc(romfs_ctx.dir_hash_table_size);
     if (dir_hash_table == NULL)
@@ -322,37 +382,6 @@ size_t build_romfs_into_file(filepath_t *in_dirpath, FILE *f_out, off_t base_off
     {
         fprintf(stderr, "Failed to allocate file table!\n");
         exit(EXIT_FAILURE);
-    }
-
-    printf("Calculating metadata\n");
-    /* Determine file offsets. */
-    cur_file = romfs_ctx.files;
-    entry_offset = 0;
-    while (cur_file != NULL)
-    {
-        romfs_ctx.file_partition_size = align64(romfs_ctx.file_partition_size, 0x10);
-        cur_file->offset = romfs_ctx.file_partition_size;
-        romfs_ctx.file_partition_size += cur_file->size;
-        cur_file->entry_offset = entry_offset;
-        entry_offset += 0x20 + align(strlen(cur_file->cur_path.char_path) - 1, 4);
-        cur_file = cur_file->next;
-    }
-
-    /* Determine dir offsets. */
-    cur_dir = root_ctx;
-    entry_offset = 0;
-    while (cur_dir != NULL)
-    {
-        cur_dir->entry_offset = entry_offset;
-        if (cur_dir == root_ctx)
-        {
-            entry_offset += 0x18;
-        }
-        else
-        {
-            entry_offset += 0x18 + align(strlen(cur_dir->cur_path.char_path) - 1, 4);
-        }
-        cur_dir = cur_dir->next;
     }
 
     /* Populate file tables. */
@@ -394,9 +423,7 @@ size_t build_romfs_into_file(filepath_t *in_dirpath, FILE *f_out, off_t base_off
         cur_entry->name_size = name_size;
         memcpy(cur_entry->name, cur_dir->cur_path.char_path + 1, name_size);
 
-        romfs_dirent_ctx_t *temp = cur_dir;
         cur_dir = cur_dir->next;
-        free(temp);
     }
 
     header.header_size = le_dword(sizeof(header));
@@ -465,9 +492,7 @@ size_t build_romfs_into_file(filepath_t *in_dirpath, FILE *f_out, off_t base_off
 
         os_fclose(f_in);
 
-        romfs_fent_ctx_t *temp = cur_file;
         cur_file = cur_file->next;
-        free(temp);
     }
     free(buffer);
 
@@ -500,6 +525,9 @@ size_t build_romfs_into_file(filepath_t *in_dirpath, FILE *f_out, off_t base_off
     }
     free(file_table);
 
+    romfs_free_dir_list(root_ctx);
+    romfs_free_file_list(romfs_ctx.files);
+
     return dir_hash_table_ofs + romfs_ctx.dir_hash_table_size + romfs_ctx.dir_table_size + romfs_ctx.file_hash_table_size + romfs_ctx.file_table_size;
 }
 
@@ -530,4 +558,74 @@ size_t romfs_build(filepath_t *in_dirpath, filepath_t *out_romfspath, uint64_t *
 
     fclose(f_out);
     return sz;
+}
+
+void romfs_collect_file_layout(filepath_t *in_dirpath, romfs_file_layout_entry_t **out_entries, uint32_t *out_entry_count)
+{
+    romfs_ctx_t romfs_ctx;
+    uint32_t dir_hash_table_entry_count = 0;
+    uint32_t file_hash_table_entry_count = 0;
+    romfs_dirent_ctx_t *root_ctx = romfs_prepare_ctx(in_dirpath, &romfs_ctx, &dir_hash_table_entry_count, &file_hash_table_entry_count);
+    romfs_file_layout_entry_t *entries = NULL;
+    romfs_fent_ctx_t *cur_file = romfs_ctx.files;
+    uint32_t index = 0;
+    size_t root_len = strlen(in_dirpath->char_path);
+
+    (void)dir_hash_table_entry_count;
+    (void)file_hash_table_entry_count;
+
+    *out_entries = NULL;
+    *out_entry_count = 0;
+
+    if (romfs_ctx.num_files > 0)
+    {
+        entries = calloc((size_t)romfs_ctx.num_files, sizeof(*entries));
+        if (entries == NULL)
+        {
+            romfs_free_dir_list(root_ctx);
+            romfs_free_file_list(romfs_ctx.files);
+            fprintf(stderr, "Failed to allocate RomFS file layout entries!\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    while (cur_file != NULL)
+    {
+        const char *relative_path = cur_file->sum_path.char_path + root_len;
+        entries[index].path = strdup(relative_path);
+        entries[index].offset = cur_file->offset + ROMFS_FILEPARTITION_OFS;
+        entries[index].size = cur_file->size;
+        if (entries[index].path == NULL)
+        {
+            romfs_free_file_layout(entries, index);
+            romfs_free_dir_list(root_ctx);
+            romfs_free_file_list(romfs_ctx.files);
+            fprintf(stderr, "Failed to duplicate RomFS file layout path!\n");
+            exit(EXIT_FAILURE);
+        }
+
+        index++;
+        cur_file = cur_file->next;
+    }
+
+    romfs_free_dir_list(root_ctx);
+    romfs_free_file_list(romfs_ctx.files);
+
+    *out_entries = entries;
+    *out_entry_count = index;
+}
+
+void romfs_free_file_layout(romfs_file_layout_entry_t *entries, uint32_t entry_count)
+{
+    if (entries == NULL)
+    {
+        return;
+    }
+
+    for (uint32_t i = 0; i < entry_count; i++)
+    {
+        free(entries[i].path);
+    }
+
+    free(entries);
 }

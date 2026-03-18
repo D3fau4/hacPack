@@ -84,6 +84,14 @@ typedef struct {
 } romfs_superblock_t;
 #pragma pack(pop)
 
+typedef struct {
+    char *path;
+    uint64_t offset;
+    uint64_t size;
+} romfs_file_layout_entry_t;
+
 size_t romfs_build(filepath_t *in_dirpath, filepath_t *out_romfspath, uint64_t *out_size);
+void romfs_collect_file_layout(filepath_t *in_dirpath, romfs_file_layout_entry_t **out_entries, uint32_t *out_entry_count);
+void romfs_free_file_layout(romfs_file_layout_entry_t *entries, uint32_t entry_count);
 
 #endif
