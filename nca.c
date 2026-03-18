@@ -18,6 +18,18 @@ typedef struct
     uint64_t patch_data_size;
 } nca_patch_layout_t;
 
+typedef struct
+{
+    uint64_t fingerprint;
+    uint64_t base_offset;
+} nca_base_block_index_entry_t;
+
+typedef struct
+{
+    nca_base_block_index_entry_t *entries;
+    uint32_t slot_count;
+} nca_base_block_index_t;
+
 #define NCA_PATCH_BLOCK_SIZE 0x10
 #define NCA_PATCH_SAME_OFFSET_REUSE_MIN_SIZE 0x20
 #define NCA_PATCH_RELOCATED_REUSE_MIN_SIZE 0x40
@@ -25,6 +37,12 @@ typedef struct
 #define NCA_PATCH_GOOD_MATCH_SIZE 0x4000
 #define NCA_PATCH_COMPARE_BUFFER_SIZE 0x4000
 #define NCA_PATCH_SOFT_SEGMENT_LIMIT (BKTR_RELOCATION_ENTRY_CAPACITY * 4)
+#define NCA_PATCH_GLOBAL_INDEX_MAX_BYTES (64U * 1024U * 1024U)
+#define NCA_PATCH_GLOBAL_INDEX_MAX_PROBES 8
+
+static void nca_read_file_exact(FILE *file, uint64_t offset, void *buffer, size_t size, const char *error_message);
+static uint64_t nca_measure_base_match(FILE *base_file, uint64_t base_size, uint64_t base_offset, FILE *current_file, uint64_t current_size, uint64_t current_offset);
+static int nca_try_read_file_exact(FILE *file, uint64_t offset, void *buffer, size_t size);
 
 static uint64_t nca_get_file_size(FILE *file)
 {
@@ -40,6 +58,162 @@ static uint32_t nca_get_section_generation(const nca_fs_header_t *fs_header)
     uint32_t generation = 0;
     memcpy(&generation, fs_header->section_ctr, sizeof(generation));
     return generation;
+}
+
+static uint64_t nca_hash_block(const unsigned char *block)
+{
+    uint64_t part0 = 0;
+    uint64_t part1 = 0;
+
+    memcpy(&part0, block, sizeof(part0));
+    memcpy(&part1, block + sizeof(part0), sizeof(part1));
+
+    part0 ^= part1 + 0x9E3779B97F4A7C15ULL + (part0 << 6) + (part0 >> 2);
+    part0 ^= part0 >> 30;
+    part0 *= 0xBF58476D1CE4E5B9ULL;
+    part0 ^= part0 >> 27;
+    part0 *= 0x94D049BB133111EBULL;
+    part0 ^= part0 >> 31;
+
+    if (part0 == 0)
+    {
+        part0 = 1;
+    }
+
+    return part0;
+}
+
+static uint32_t nca_next_power_of_two_u32(uint32_t value)
+{
+    if (value <= 1)
+    {
+        return 1;
+    }
+
+    value--;
+    value |= value >> 1;
+    value |= value >> 2;
+    value |= value >> 4;
+    value |= value >> 8;
+    value |= value >> 16;
+    return value + 1;
+}
+
+static void nca_base_block_index_init(nca_base_block_index_t *index)
+{
+    memset(index, 0, sizeof(*index));
+}
+
+static void nca_base_block_index_free(nca_base_block_index_t *index)
+{
+    free(index->entries);
+    memset(index, 0, sizeof(*index));
+}
+
+static void nca_base_block_index_insert(nca_base_block_index_t *index, uint64_t fingerprint, uint64_t base_offset)
+{
+    uint32_t mask = index->slot_count - 1;
+    uint32_t slot = (uint32_t)fingerprint & mask;
+
+    for (uint32_t probe = 0; probe < NCA_PATCH_GLOBAL_INDEX_MAX_PROBES; probe++)
+    {
+        nca_base_block_index_entry_t *entry = &index->entries[(slot + probe) & mask];
+        if (entry->fingerprint == 0 || entry->fingerprint == fingerprint)
+        {
+            entry->fingerprint = fingerprint;
+            entry->base_offset = base_offset;
+            return;
+        }
+    }
+
+    index->entries[slot].fingerprint = fingerprint;
+    index->entries[slot].base_offset = base_offset;
+}
+
+static void nca_build_base_block_index(FILE *base_file, uint64_t base_size, nca_base_block_index_t *index)
+{
+    unsigned char block[NCA_PATCH_BLOCK_SIZE];
+    uint64_t base_offset = 0;
+    uint64_t block_count = base_size / NCA_PATCH_BLOCK_SIZE;
+    uint64_t max_slots = NCA_PATCH_GLOBAL_INDEX_MAX_BYTES / sizeof(nca_base_block_index_entry_t);
+    uint32_t slot_count;
+
+    nca_base_block_index_init(index);
+
+    if (block_count == 0 || max_slots < 2)
+    {
+        return;
+    }
+
+    if (block_count * 2 < max_slots)
+    {
+        max_slots = block_count * 2;
+    }
+
+    slot_count = nca_next_power_of_two_u32((uint32_t)max_slots);
+    index->entries = calloc(slot_count, sizeof(*index->entries));
+    if (index->entries == NULL)
+    {
+        FATAL_ERROR("Failed to allocate global base block index");
+    }
+    index->slot_count = slot_count;
+
+    while (base_offset + NCA_PATCH_BLOCK_SIZE <= base_size)
+    {
+        nca_read_file_exact(base_file, base_offset, block, sizeof(block), "Failed to read base RomFS section");
+        nca_base_block_index_insert(index, nca_hash_block(block), base_offset);
+        base_offset += NCA_PATCH_BLOCK_SIZE;
+    }
+}
+
+static uint64_t nca_find_indexed_base_match(const nca_base_block_index_t *index, FILE *base_file, uint64_t base_size, const unsigned char *current_block, FILE *current_file, uint64_t current_size, uint64_t current_offset, uint64_t *out_base_offset)
+{
+    uint64_t fingerprint;
+    uint32_t mask;
+    uint32_t slot;
+    uint64_t best_offset = 0;
+    uint64_t best_size = 0;
+
+    if (index->entries == NULL || index->slot_count == 0)
+    {
+        return 0;
+    }
+
+    fingerprint = nca_hash_block(current_block);
+    mask = index->slot_count - 1;
+    slot = (uint32_t)fingerprint & mask;
+
+    for (uint32_t probe = 0; probe < NCA_PATCH_GLOBAL_INDEX_MAX_PROBES; probe++)
+    {
+        nca_base_block_index_entry_t *entry = &index->entries[(slot + probe) & mask];
+        uint64_t candidate_size;
+
+        if (entry->fingerprint == 0)
+        {
+            break;
+        }
+        if (entry->fingerprint != fingerprint)
+        {
+            continue;
+        }
+
+        candidate_size = nca_measure_base_match(base_file, base_size, entry->base_offset, current_file, current_size, current_offset);
+        if (candidate_size >= NCA_PATCH_RELOCATED_REUSE_MIN_SIZE && candidate_size > best_size)
+        {
+            best_offset = entry->base_offset;
+            best_size = candidate_size;
+        }
+        if (best_size >= NCA_PATCH_GOOD_MATCH_SIZE)
+        {
+            break;
+        }
+    }
+
+    if (best_size > 0)
+    {
+        *out_base_offset = best_offset;
+    }
+    return best_size;
 }
 
 static void nca_append_layout_segment(nca_patch_layout_t *layout, uint32_t *capacity, uint64_t virtual_offset, uint64_t size, uint64_t physical_offset, uint32_t is_patch)
@@ -168,11 +342,20 @@ static void nca_build_full_patch_layout(nca_patch_layout_t *layout, uint64_t siz
 
 static void nca_read_file_exact(FILE *file, uint64_t offset, void *buffer, size_t size, const char *error_message)
 {
-    fseeko64(file, offset, SEEK_SET);
-    if (fread(buffer, 1, size, file) != size)
+    if (!nca_try_read_file_exact(file, offset, buffer, size))
     {
         FATAL_ERROR(error_message);
     }
+}
+
+static int nca_try_read_file_exact(FILE *file, uint64_t offset, void *buffer, size_t size)
+{
+    if (fseeko64(file, offset, SEEK_SET) != 0)
+    {
+        return 0;
+    }
+
+    return fread(buffer, 1, size, file) == size;
 }
 
 static uint64_t nca_measure_base_match(FILE *base_file, uint64_t base_size, uint64_t base_offset, FILE *current_file, uint64_t current_size, uint64_t current_offset)
@@ -198,8 +381,11 @@ static uint64_t nca_measure_base_match(FILE *base_file, uint64_t base_size, uint
         }
         read_size -= (read_size % NCA_PATCH_BLOCK_SIZE);
 
-        nca_read_file_exact(base_file, base_offset + matched_size, base_buffer, (size_t)read_size, "Failed to read base RomFS section");
-        nca_read_file_exact(current_file, current_offset + matched_size, current_buffer, (size_t)read_size, "Failed to read current RomFS section");
+        if (!nca_try_read_file_exact(base_file, base_offset + matched_size, base_buffer, (size_t)read_size) ||
+            !nca_try_read_file_exact(current_file, current_offset + matched_size, current_buffer, (size_t)read_size))
+        {
+            return 0;
+        }
 
         if (memcmp(base_buffer, current_buffer, (size_t)read_size) == 0)
         {
@@ -223,12 +409,13 @@ static uint64_t nca_measure_base_match(FILE *base_file, uint64_t base_size, uint
     return matched_size;
 }
 
-static uint64_t nca_find_base_match(FILE *base_file, uint64_t base_size, FILE *current_file, uint64_t current_size, uint64_t current_offset, uint64_t *out_base_offset)
+static uint64_t nca_find_base_match(const nca_base_block_index_t *index, FILE *base_file, uint64_t base_size, FILE *current_file, uint64_t current_size, uint64_t current_offset, uint64_t *out_base_offset)
 {
     unsigned char current_block[NCA_PATCH_BLOCK_SIZE];
     unsigned char base_block[NCA_PATCH_BLOCK_SIZE];
     uint64_t best_offset = 0;
     uint64_t best_size = 0;
+    uint64_t indexed_match_size = 0;
 
     if (current_offset + NCA_PATCH_BLOCK_SIZE > current_size)
     {
@@ -271,7 +458,10 @@ static uint64_t nca_find_base_match(FILE *base_file, uint64_t base_size, FILE *c
             uint64_t candidate_offset = candidate_offsets[i];
             uint64_t candidate_size;
 
-            nca_read_file_exact(base_file, candidate_offset, base_block, sizeof(base_block), "Failed to read base RomFS section");
+            if (!nca_try_read_file_exact(base_file, candidate_offset, base_block, sizeof(base_block)))
+            {
+                continue;
+            }
             if (memcmp(base_block, current_block, sizeof(current_block)) != 0)
             {
                 continue;
@@ -291,6 +481,12 @@ static uint64_t nca_find_base_match(FILE *base_file, uint64_t base_size, FILE *c
         }
     }
 
+    indexed_match_size = nca_find_indexed_base_match(index, base_file, base_size, current_block, current_file, current_size, current_offset, &best_offset);
+    if (indexed_match_size > best_size)
+    {
+        best_size = indexed_match_size;
+    }
+
     if (best_size >= NCA_PATCH_SAME_OFFSET_REUSE_MIN_SIZE)
     {
         *out_base_offset = best_offset;
@@ -302,12 +498,14 @@ static uint64_t nca_find_base_match(FILE *base_file, uint64_t base_size, FILE *c
 
 static void nca_build_patch_layout(FILE *base_file, uint64_t base_size, FILE *current_file, uint64_t current_size, nca_patch_layout_t *layout)
 {
+    nca_base_block_index_t base_index;
     uint32_t capacity = 0;
     uint64_t pending_patch_offset = UINT64_MAX;
     static const uint64_t merge_thresholds[] = {0x20, 0x40, 0x80, 0x100, 0x200, 0x400};
 
     free(layout->segments);
     memset(layout, 0, sizeof(*layout));
+    nca_base_block_index_init(&base_index);
 
     if (base_file == NULL || base_size == 0)
     {
@@ -315,11 +513,13 @@ static void nca_build_patch_layout(FILE *base_file, uint64_t base_size, FILE *cu
         return;
     }
 
+    nca_build_base_block_index(base_file, base_size, &base_index);
+
     uint64_t offset = 0;
     while (offset < current_size)
     {
         uint64_t base_match_offset = 0;
-        uint64_t base_match_size = nca_find_base_match(base_file, base_size, current_file, current_size, offset, &base_match_offset);
+        uint64_t base_match_size = nca_find_base_match(&base_index, base_file, base_size, current_file, current_size, offset, &base_match_offset);
 
         if (base_match_size > 0)
         {
@@ -363,6 +563,8 @@ static void nca_build_patch_layout(FILE *base_file, uint64_t base_size, FILE *cu
         printf("BKTR diff still too fragmented, falling back to full replacement patch data\n");
         nca_build_full_patch_layout(layout, current_size);
     }
+
+    nca_base_block_index_free(&base_index);
 }
 
 static void nca_copy_file_range(FILE *dst, uint64_t dst_offset, FILE *src, uint64_t src_offset, uint64_t size)
