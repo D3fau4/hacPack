@@ -9,6 +9,7 @@
 #include "ivfc.h"
 
 #define MAGIC_NCA3 0x3341434E /* "NCA3" */
+#define IVFC_BLOCK_SIZE_LOG2 0x0E /* log2(0x4000) */
 
 #pragma pack(push, 1)
 typedef struct
