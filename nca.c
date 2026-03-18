@@ -11,6 +11,17 @@
 #include "ticket.h"
 #include "rsa.h"
 
+#define NCA_PATCH_BLOCK_SIZE 0x10
+#define NCA_PATCH_SAME_OFFSET_REUSE_MIN_SIZE 0x20
+#define NCA_PATCH_RELOCATED_REUSE_MIN_SIZE 0x40
+#define NCA_PATCH_LOCAL_SEARCH_WINDOW 0x1000
+#define NCA_PATCH_GOOD_MATCH_SIZE 0x4000
+#define NCA_PATCH_COMPARE_BUFFER_SIZE 0x4000
+#define NCA_PATCH_SOFT_SEGMENT_LIMIT (BKTR_RELOCATION_ENTRY_CAPACITY * 4)
+#define NCA_PATCH_GLOBAL_INDEX_MAX_BYTES (64U * 1024U * 1024U)
+#define NCA_PATCH_GLOBAL_INDEX_MAX_PROBES 8
+#define NCA_PATCH_GLOBAL_INDEX_CANDIDATES 8
+
 typedef struct
 {
     bktr_relocation_segment_t *segments;
@@ -21,7 +32,9 @@ typedef struct
 typedef struct
 {
     uint64_t fingerprint;
-    uint64_t base_offset;
+    uint32_t candidate_count;
+    uint32_t seen_count;
+    uint64_t base_offsets[NCA_PATCH_GLOBAL_INDEX_CANDIDATES];
 } nca_base_block_index_entry_t;
 
 typedef struct
@@ -29,16 +42,6 @@ typedef struct
     nca_base_block_index_entry_t *entries;
     uint32_t slot_count;
 } nca_base_block_index_t;
-
-#define NCA_PATCH_BLOCK_SIZE 0x10
-#define NCA_PATCH_SAME_OFFSET_REUSE_MIN_SIZE 0x20
-#define NCA_PATCH_RELOCATED_REUSE_MIN_SIZE 0x40
-#define NCA_PATCH_LOCAL_SEARCH_WINDOW 0x1000
-#define NCA_PATCH_GOOD_MATCH_SIZE 0x4000
-#define NCA_PATCH_COMPARE_BUFFER_SIZE 0x4000
-#define NCA_PATCH_SOFT_SEGMENT_LIMIT (BKTR_RELOCATION_ENTRY_CAPACITY * 4)
-#define NCA_PATCH_GLOBAL_INDEX_MAX_BYTES (64U * 1024U * 1024U)
-#define NCA_PATCH_GLOBAL_INDEX_MAX_PROBES 8
 
 static void nca_read_file_exact(FILE *file, uint64_t offset, void *buffer, size_t size, const char *error_message);
 static uint64_t nca_measure_base_match(FILE *base_file, uint64_t base_size, uint64_t base_offset, FILE *current_file, uint64_t current_size, uint64_t current_offset);
@@ -120,14 +123,31 @@ static void nca_base_block_index_insert(nca_base_block_index_t *index, uint64_t 
         nca_base_block_index_entry_t *entry = &index->entries[(slot + probe) & mask];
         if (entry->fingerprint == 0 || entry->fingerprint == fingerprint)
         {
+            if (entry->fingerprint == 0)
+            {
+                memset(entry, 0, sizeof(*entry));
+                entry->fingerprint = fingerprint;
+            }
+
             entry->fingerprint = fingerprint;
-            entry->base_offset = base_offset;
+            if (entry->candidate_count < NCA_PATCH_GLOBAL_INDEX_CANDIDATES)
+            {
+                entry->base_offsets[entry->candidate_count++] = base_offset;
+            }
+            else
+            {
+                entry->base_offsets[entry->seen_count % NCA_PATCH_GLOBAL_INDEX_CANDIDATES] = base_offset;
+            }
+            entry->seen_count++;
             return;
         }
     }
 
+    memset(&index->entries[slot], 0, sizeof(index->entries[slot]));
     index->entries[slot].fingerprint = fingerprint;
-    index->entries[slot].base_offset = base_offset;
+    index->entries[slot].base_offsets[0] = base_offset;
+    index->entries[slot].candidate_count = 1;
+    index->entries[slot].seen_count = 1;
 }
 
 static void nca_build_base_block_index(FILE *base_file, uint64_t base_size, nca_base_block_index_t *index)
@@ -186,7 +206,6 @@ static uint64_t nca_find_indexed_base_match(const nca_base_block_index_t *index,
     for (uint32_t probe = 0; probe < NCA_PATCH_GLOBAL_INDEX_MAX_PROBES; probe++)
     {
         nca_base_block_index_entry_t *entry = &index->entries[(slot + probe) & mask];
-        uint64_t candidate_size;
 
         if (entry->fingerprint == 0)
         {
@@ -197,12 +216,22 @@ static uint64_t nca_find_indexed_base_match(const nca_base_block_index_t *index,
             continue;
         }
 
-        candidate_size = nca_measure_base_match(base_file, base_size, entry->base_offset, current_file, current_size, current_offset);
-        if (candidate_size >= NCA_PATCH_RELOCATED_REUSE_MIN_SIZE && candidate_size > best_size)
+        for (uint32_t candidate_index = 0; candidate_index < entry->candidate_count; candidate_index++)
         {
-            best_offset = entry->base_offset;
-            best_size = candidate_size;
+            uint64_t candidate_offset = entry->base_offsets[candidate_index];
+            uint64_t candidate_size = nca_measure_base_match(base_file, base_size, candidate_offset, current_file, current_size, current_offset);
+
+            if (candidate_size >= NCA_PATCH_RELOCATED_REUSE_MIN_SIZE && candidate_size > best_size)
+            {
+                best_offset = candidate_offset;
+                best_size = candidate_size;
+            }
+            if (best_size >= NCA_PATCH_GOOD_MATCH_SIZE)
+            {
+                break;
+            }
         }
+
         if (best_size >= NCA_PATCH_GOOD_MATCH_SIZE)
         {
             break;
@@ -481,10 +510,14 @@ static uint64_t nca_find_base_match(const nca_base_block_index_t *index, FILE *b
         }
     }
 
-    indexed_match_size = nca_find_indexed_base_match(index, base_file, base_size, current_block, current_file, current_size, current_offset, &best_offset);
-    if (indexed_match_size > best_size)
     {
-        best_size = indexed_match_size;
+        uint64_t indexed_match_offset = 0;
+        indexed_match_size = nca_find_indexed_base_match(index, base_file, base_size, current_block, current_file, current_size, current_offset, &indexed_match_offset);
+        if (indexed_match_size >= NCA_PATCH_GOOD_MATCH_SIZE && indexed_match_size > best_size)
+        {
+            best_offset = indexed_match_offset;
+            best_size = indexed_match_size;
+        }
     }
 
     if (best_size >= NCA_PATCH_SAME_OFFSET_REUSE_MIN_SIZE)
