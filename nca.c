@@ -125,6 +125,7 @@ static uint64_t nca_hash_bytes(const unsigned char *data, size_t size, uint64_t 
 static uint64_t nca_hash_block(const unsigned char *block);
 static uint64_t nca_compute_file_hint_signature(const filepath_t *source_path, uint64_t size);
 static uint64_t nca_choose_patch_probe_step(uint64_t pending_patch_size);
+static void nca_print_patch_layout_progress(uint64_t processed_size, uint64_t total_size, uint32_t percent);
 static void nca_profile_add(double *total_ms, uint64_t start_ticks);
 
 static uint64_t nca_get_file_size(FILE *file)
@@ -956,6 +957,23 @@ static uint64_t nca_choose_patch_probe_step(uint64_t pending_patch_size)
     return NCA_PATCH_BLOCK_SIZE;
 }
 
+static void nca_print_patch_layout_progress(uint64_t processed_size, uint64_t total_size, uint32_t percent)
+{
+    uint64_t processed_mib = processed_size / (1024U * 1024U);
+    uint64_t total_mib = total_size / (1024U * 1024U);
+
+    if (total_size == 0)
+    {
+        printf("BKTR diff progress: 100%% (0 / 0 MiB)\n");
+        return;
+    }
+
+    printf("BKTR diff progress: %3u%% (%" PRIu64 " / %" PRIu64 " MiB)\n",
+           percent,
+           processed_mib,
+           total_mib);
+}
+
 static int nca_try_read_file_exact(FILE *file, uint64_t offset, void *buffer, size_t size)
 {
     if (fseeko64(file, offset, SEEK_SET) != 0)
@@ -1214,6 +1232,7 @@ static void nca_build_patch_layout(FILE *base_file, uint64_t base_size, FILE *cu
     nca_current_block_cache_t current_block_cache;
     uint32_t capacity = 0;
     uint64_t pending_patch_offset = UINT64_MAX;
+    uint32_t next_progress_percent = 0;
     static const uint64_t merge_thresholds[] = {0x20, 0x40, 0x80, 0x100, 0x200, 0x400};
 
     free(layout->segments);
@@ -1233,6 +1252,9 @@ static void nca_build_patch_layout(FILE *base_file, uint64_t base_size, FILE *cu
     }
 
     nca_build_base_block_index(base_file, base_size, &base_index);
+
+    printf("\n===> Building BKTR layout\n");
+    nca_print_patch_layout_progress(0, current_size, 0);
 
     uint64_t offset = 0;
     while (offset < current_size)
@@ -1291,6 +1313,26 @@ static void nca_build_patch_layout(FILE *base_file, uint64_t base_size, FILE *cu
 
             offset += advance;
         }
+
+        while (current_size > 0 && next_progress_percent < 100)
+        {
+            uint64_t progress_target;
+
+            next_progress_percent += 5;
+            progress_target = (current_size * next_progress_percent) / 100;
+            if (offset < progress_target)
+            {
+                next_progress_percent -= 5;
+                break;
+            }
+
+            nca_print_patch_layout_progress(offset, current_size, next_progress_percent);
+        }
+    }
+
+    if (next_progress_percent < 100)
+    {
+        nca_print_patch_layout_progress(current_size, current_size, 100);
     }
 
     if (pending_patch_offset != UINT64_MAX)
