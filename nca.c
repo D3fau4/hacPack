@@ -11,6 +11,37 @@
 #include "ticket.h"
 #include "rsa.h"
 
+/* Initialize common NCA header fields shared by all NCA types. */
+static void nca_init_common_header(nca_header_t *nca_header, hp_settings_t *settings)
+{
+    nca_header->magic = MAGIC_NCA3;
+    nca_header->content_type = settings->nca_type;
+    nca_header->sdk_version = settings->sdk_version;
+    nca_header->title_id = settings->title_id;
+    if (settings->nca_disttype == NCA_DISTRIBUTION_GAMECARD)
+        nca_header->distribution = 1;
+    nca_set_keygen(nca_header, settings);
+}
+
+/* Initialize temp file paths for the 6 IVFC hash levels. */
+static void nca_init_ivfc_level_paths(filepath_t *levels, filepath_t *temp_dir, const char *prefix)
+{
+    for (int i = 0; i < IVFC_MAX_LEVEL; i++)
+    {
+        filepath_init(&levels[i]);
+        filepath_copy(&levels[i], temp_dir);
+        filepath_append(&levels[i], "%s_ivfc_lvl%d", prefix, i + 1);
+    }
+}
+
+/* Set the rights ID in the NCA header from the title ID and key generation. */
+static void nca_set_rights_id(nca_header_t *nca_header, hp_settings_t *settings)
+{
+    for (int i = 0; i < 8; i++)
+        nca_header->rights_id[7 - i] = (settings->title_id >> (8 * i)) & 0xff;
+    nca_header->rights_id[15] = (uint8_t)settings->keygeneration;
+}
+
 void nca_create_romfs_type(hp_settings_t *settings, char *nca_type)
 {
     printf("----> Creating %s NCA:\n", nca_type);
@@ -39,55 +70,46 @@ void nca_create_romfs_type(hp_settings_t *settings, char *nca_type)
     printf("\n---> Creating Section 0:");
 
     // Set IVFC levels temp filepaths
-    filepath_t ivfc_lvls_path[6];
-    for (int a = 0; a < 6; a++)
-    {
-        filepath_init(&ivfc_lvls_path[a]);
-        filepath_copy(&ivfc_lvls_path[a], &settings->temp_dir);
-        filepath_append(&ivfc_lvls_path[a], "%s_sec0_ivfc_lvl%i", nca_type, a + 1);
-    }
+    filepath_t ivfc_lvls_path[IVFC_MAX_LEVEL];
+    char ivfc_prefix[64];
+    snprintf(ivfc_prefix, sizeof(ivfc_prefix), "%s_sec0", nca_type);
+    nca_init_ivfc_level_paths(ivfc_lvls_path, &settings->temp_dir, ivfc_prefix);
 
     //Build RomFS
     printf("\n===> Building RomFS\n");
     romfs_build(&settings->romfs_dir, &ivfc_lvls_path[5], &nca_header.fs_headers[0].romfs_superblock.ivfc_header.level_headers[5].hash_data_size);
-    nca_header.fs_headers[0].romfs_superblock.ivfc_header.level_headers[5].block_size = 0x0E; // 0x4000
+    nca_header.fs_headers[0].romfs_superblock.ivfc_header.level_headers[5].block_size = IVFC_BLOCK_SIZE_LOG2;
 
     // Create IVFC levels
     printf("\n===> Creating IVFC levels\n");
-    for (int b = 4; b >= 0; b--)
+    for (int lvl = 4; lvl >= 0; lvl--)
     {
-        printf("Writing %s\n", ivfc_lvls_path[b].char_path);
-        ivfc_create_level(&ivfc_lvls_path[b], &ivfc_lvls_path[b + 1], &nca_header.fs_headers[0].romfs_superblock.ivfc_header.level_headers[b].hash_data_size);
-        nca_header.fs_headers[0].romfs_superblock.ivfc_header.level_headers[b].block_size = 0x0E; // 0x4000
+        printf("Writing %s\n", ivfc_lvls_path[lvl].char_path);
+        ivfc_create_level(&ivfc_lvls_path[lvl], &ivfc_lvls_path[lvl + 1], &nca_header.fs_headers[0].romfs_superblock.ivfc_header.level_headers[lvl].hash_data_size);
+        nca_header.fs_headers[0].romfs_superblock.ivfc_header.level_headers[lvl].block_size = IVFC_BLOCK_SIZE_LOG2;
     }
 
     // Set IVFC levels logical offset
     nca_header.fs_headers[0].romfs_superblock.ivfc_header.level_headers[0].logical_offset = 0;
-    for (int i = 1; i <= 5; i++)
+    for (int i = 1; i < IVFC_MAX_LEVEL; i++)
         nca_header.fs_headers[0].romfs_superblock.ivfc_header.level_headers[i].logical_offset = nca_header.fs_headers[0].romfs_superblock.ivfc_header.level_headers[i - 1].logical_offset + nca_header.fs_headers[0].romfs_superblock.ivfc_header.level_headers[i - 1].hash_data_size;
 
     // Write IVFC levels
     printf("\n===> Writing IVFC levels\n");
-    for (int c = 0; c < 6; c++)
+    for (int i = 0; i < IVFC_MAX_LEVEL; i++)
     {
-        printf("Writing %s to %s\n", ivfc_lvls_path[c].char_path, romfs_nca_path.char_path);
-        nca_write_file(romfs_nca_file, &ivfc_lvls_path[c]);
+        printf("Writing %s to %s\n", ivfc_lvls_path[i].char_path, romfs_nca_path.char_path);
+        nca_write_file(romfs_nca_file, &ivfc_lvls_path[i]);
     }
 
     // Write Padding if required
     nca_write_padding(romfs_nca_file);
 
     // Common values
-    nca_header.magic = MAGIC_NCA3;
-    nca_header.content_type = settings->nca_type;
-    nca_header.sdk_version = settings->sdk_version;
-    nca_header.title_id = settings->title_id;
-    if (settings->nca_disttype == NCA_DISTRIBUTION_GAMECARD)
-        nca_header.distribution = 1;
-    nca_set_keygen(&nca_header, settings);
+    nca_init_common_header(&nca_header, settings);
 
-    nca_header.section_entries[0].media_start_offset = 0x6;                                        // 0xC00 / 0x200
-    nca_header.section_entries[0].media_end_offset = (uint32_t)(ftello64(romfs_nca_file) / 0x200); // Section end offset / 200
+    nca_header.section_entries[0].media_start_offset = 0x6;                                        // 0xC00 / MEDIA_SIZE
+    nca_header.section_entries[0].media_end_offset = (uint32_t)(ftello64(romfs_nca_file) / MEDIA_SIZE); // Section end offset / MEDIA_SIZE
     nca_header.section_entries[0]._0x8[0] = 0x1;                                                   // Always 1
 
     nca_header.fs_headers[0].hash_type = HASH_TYPE_ROMFS;
@@ -114,14 +136,7 @@ void nca_create_romfs_type(hp_settings_t *settings, char *nca_type)
         // Set encrypted key area key 2
         memcpy(nca_header.encrypted_keys[2], settings->keyareakey, 0x10);
     else
-    {
-        // Calculate RightsID
-        for (int ridc = 0; ridc < 8; ridc++)
-        {
-            nca_header.rights_id[7 - ridc] = (settings->title_id >> (8 * ridc) & 0xff);
-        }
-        nca_header.rights_id[15] = (uint8_t)settings->keygeneration;
-    }
+        nca_set_rights_id(&nca_header, settings);
 
     printf("===> Encrypting NCA\n");
     if (settings->plaintext == 0)
@@ -131,7 +146,6 @@ void nca_create_romfs_type(hp_settings_t *settings, char *nca_type)
         nca_encrypt_section(romfs_nca_file, &nca_header, 0, settings);
     }
 
-    // Crypto type
     printf("Getting NCA file size\n");
     fseeko64(romfs_nca_file, 0, SEEK_END);
     nca_header.nca_size = (uint64_t)ftello64(romfs_nca_file);
@@ -245,16 +259,10 @@ void nca_create_program(hp_settings_t *settings)
     nca_write_padding(program_nca_file);
 
     // Common values
-    nca_header.magic = MAGIC_NCA3;
-    nca_header.content_type = 0x0; // Program
-    nca_header.sdk_version = settings->sdk_version;
-    nca_header.title_id = settings->title_id;
-    if (settings->nca_disttype == NCA_DISTRIBUTION_GAMECARD)
-        nca_header.distribution = 1;
-    nca_set_keygen(&nca_header, settings);
+    nca_init_common_header(&nca_header, settings);
 
-    nca_header.section_entries[0].media_start_offset = 0x6;                                          // 0xC00 / 0x200
-    nca_header.section_entries[0].media_end_offset = (uint32_t)(ftello64(program_nca_file) / 0x200); // Section end offset / 200
+    nca_header.section_entries[0].media_start_offset = 0x6;                                          // 0xC00 / MEDIA_SIZE
+    nca_header.section_entries[0].media_end_offset = (uint32_t)(ftello64(program_nca_file) / MEDIA_SIZE); // Section end offset / MEDIA_SIZE
     nca_header.section_entries[0]._0x8[0] = 0x1;                                                     // Always 1
 
     nca_header.fs_headers[0].hash_type = HASH_TYPE_PFS0;
@@ -280,39 +288,34 @@ void nca_create_program(hp_settings_t *settings)
         printf("\n---> Creating Section 1:");
 
         // Set IVFC levels temp filepaths
-        filepath_t ivfc_lvls_path[6];
-        for (int a = 0; a < 6; a++)
-        {
-            filepath_init(&ivfc_lvls_path[a]);
-            filepath_copy(&ivfc_lvls_path[a], &settings->temp_dir);
-            filepath_append(&ivfc_lvls_path[a], "program_sec1_ivfc_lvl%i", a + 1);
-        }
+        filepath_t ivfc_lvls_path[IVFC_MAX_LEVEL];
+        nca_init_ivfc_level_paths(ivfc_lvls_path, &settings->temp_dir, "program_sec1");
 
         //Build RomFS
         printf("\n===> Building RomFS\n");
         romfs_build(&settings->romfs_dir, &ivfc_lvls_path[5], &nca_header.fs_headers[1].romfs_superblock.ivfc_header.level_headers[5].hash_data_size);
-        nca_header.fs_headers[1].romfs_superblock.ivfc_header.level_headers[5].block_size = 0x0E; // 0x4000
+        nca_header.fs_headers[1].romfs_superblock.ivfc_header.level_headers[5].block_size = IVFC_BLOCK_SIZE_LOG2;
 
         // Create IVFC levels
         printf("\n===> Creating IVFC levels\n");
-        for (int b = 4; b >= 0; b--)
+        for (int lvl = 4; lvl >= 0; lvl--)
         {
-            printf("Writing %s\n", ivfc_lvls_path[b].char_path);
-            ivfc_create_level(&ivfc_lvls_path[b], &ivfc_lvls_path[b + 1], &nca_header.fs_headers[1].romfs_superblock.ivfc_header.level_headers[b].hash_data_size);
-            nca_header.fs_headers[1].romfs_superblock.ivfc_header.level_headers[b].block_size = 0x0E; // 0x4000
+            printf("Writing %s\n", ivfc_lvls_path[lvl].char_path);
+            ivfc_create_level(&ivfc_lvls_path[lvl], &ivfc_lvls_path[lvl + 1], &nca_header.fs_headers[1].romfs_superblock.ivfc_header.level_headers[lvl].hash_data_size);
+            nca_header.fs_headers[1].romfs_superblock.ivfc_header.level_headers[lvl].block_size = IVFC_BLOCK_SIZE_LOG2;
         }
 
         // Set IVFC levels logical offset
         nca_header.fs_headers[1].romfs_superblock.ivfc_header.level_headers[0].logical_offset = 0;
-        for (int i = 1; i <= 5; i++)
+        for (int i = 1; i < IVFC_MAX_LEVEL; i++)
             nca_header.fs_headers[1].romfs_superblock.ivfc_header.level_headers[i].logical_offset = nca_header.fs_headers[1].romfs_superblock.ivfc_header.level_headers[i - 1].logical_offset + nca_header.fs_headers[1].romfs_superblock.ivfc_header.level_headers[i - 1].hash_data_size;
 
         // Write IVFC levels
         printf("\n===> Writing IVFC levels\n");
-        for (int c = 0; c < 6; c++)
+        for (int i = 0; i < IVFC_MAX_LEVEL; i++)
         {
-            printf("Writing %s to %s\n", ivfc_lvls_path[c].char_path, program_nca_path.char_path);
-            nca_write_file(program_nca_file, &ivfc_lvls_path[c]);
+            printf("Writing %s to %s\n", ivfc_lvls_path[i].char_path, program_nca_path.char_path);
+            nca_write_file(program_nca_file, &ivfc_lvls_path[i]);
         }
 
         // Write Padding if required
@@ -320,7 +323,7 @@ void nca_create_program(hp_settings_t *settings)
 
         // Set header values
         nca_header.section_entries[1].media_start_offset = nca_header.section_entries[0].media_end_offset;
-        nca_header.section_entries[1].media_end_offset = (uint32_t)(ftello64(program_nca_file) / 0x200);
+        nca_header.section_entries[1].media_end_offset = (uint32_t)(ftello64(program_nca_file) / MEDIA_SIZE);
         nca_header.section_entries[1]._0x8[0] = 0x1; // Always 1
 
         nca_header.fs_headers[1].hash_type = HASH_TYPE_ROMFS;
@@ -376,7 +379,7 @@ void nca_create_program(hp_settings_t *settings)
         else
             nca_header.section_entries[2].media_start_offset = nca_header.section_entries[0].media_end_offset;
 
-        nca_header.section_entries[2].media_end_offset = (uint32_t)(ftello64(program_nca_file) / 0x200); // Section end offset / 200
+        nca_header.section_entries[2].media_end_offset = (uint32_t)(ftello64(program_nca_file) / MEDIA_SIZE); // Section end offset / MEDIA_SIZE
         nca_header.section_entries[2]._0x8[0] = 0x1;                                                     // Always 1
 
         nca_header.fs_headers[2].hash_type = HASH_TYPE_PFS0;
@@ -400,14 +403,7 @@ void nca_create_program(hp_settings_t *settings)
         // Set encrypted key area key 2
         memcpy(nca_header.encrypted_keys[2], settings->keyareakey, 0x10);
     else
-    {
-        // Calculate RightsID
-        for (int ridc = 0; ridc < 8; ridc++)
-        {
-            nca_header.rights_id[7 - ridc] = (settings->title_id >> (8 * ridc) & 0xff);
-        }
-        nca_header.rights_id[15] = (uint8_t)settings->keygeneration;
-    }
+        nca_set_rights_id(&nca_header, settings);
 
     printf("===> Encrypting NCA\n");
     // Encrypt sections
@@ -613,16 +609,10 @@ void nca_create_meta(hp_settings_t *settings)
     nca_write_padding(meta_nca_file);
 
     // Common values
-    nca_header.magic = MAGIC_NCA3;
-    nca_header.content_type = 0x1; // Meta
-    nca_header.sdk_version = settings->sdk_version;
-    nca_header.title_id = settings->title_id;
-    if (settings->nca_disttype == NCA_DISTRIBUTION_GAMECARD)
-        nca_header.distribution = 1;
-    nca_set_keygen(&nca_header, settings);
+    nca_init_common_header(&nca_header, settings);
 
-    nca_header.section_entries[0].media_start_offset = 0x6;                                       // 0xC00 / 0x200
-    nca_header.section_entries[0].media_end_offset = (uint32_t)(ftello64(meta_nca_file) / 0x200); // Section end offset / 200
+    nca_header.section_entries[0].media_start_offset = 0x6;                                       // 0xC00 / MEDIA_SIZE
+    nca_header.section_entries[0].media_end_offset = (uint32_t)(ftello64(meta_nca_file) / MEDIA_SIZE); // Section end offset / MEDIA_SIZE
     nca_header.section_entries[0]._0x8[0] = 0x1;                                                  // Always 1
 
     nca_header.fs_headers[0].hash_type = HASH_TYPE_PFS0;
@@ -753,13 +743,11 @@ void nca_write_file(FILE *nca_file, filepath_t *file_path)
 // Write padding for media_end_offset
 void nca_write_padding(FILE *nca_file)
 {
-    unsigned char *buf = (unsigned char *)calloc(1, 0x200);
-    uint64_t curr_offset = ftello64(nca_file);
-    uint64_t block_size = 0x200;
-    uint64_t padding_size = block_size - (curr_offset % block_size);
-    if (curr_offset % block_size != 0)
-        fwrite(buf, 1, padding_size, nca_file);
-    free(buf);
+    static const unsigned char zeros[MEDIA_SIZE] = {0};
+    uint64_t curr_offset = (uint64_t)ftello64(nca_file);
+    uint64_t padding_size = MEDIA_SIZE - (curr_offset % MEDIA_SIZE);
+    if (curr_offset % MEDIA_SIZE != 0)
+        fwrite(zeros, 1, padding_size, nca_file);
 }
 
 void nca_calculate_section_hash(nca_fs_header_t *fs_header, uint8_t *out_section_hash)
@@ -788,9 +776,9 @@ void nca_encrypt_header(nca_header_t *nca_header, hp_settings_t *settings)
 void nca_encrypt_section(FILE *nca_file, nca_header_t *nca_header, uint8_t section_index, hp_settings_t *settings)
 {
     uint64_t start_offset = nca_header->section_entries[section_index].media_start_offset;
-    start_offset *= 0x200;
+    start_offset *= MEDIA_SIZE;
     uint64_t end_offset = nca_header->section_entries[section_index].media_end_offset;
-    end_offset *= 0x200;
+    end_offset *= MEDIA_SIZE;
     uint64_t filesize = end_offset - start_offset;
 
     // Calculate counter for section encryption
@@ -927,16 +915,12 @@ char *nca_romfs_get_type(uint8_t type)
     {
     case NCA_TYPE_CONTROL:
         return "Control";
-        break;
     case NCA_TYPE_DATA:
         return "Data";
-        break;
     case NCA_TYPE_MANUAL:
         return "Manual";
-        break;
     case NCA_TYPE_PUBLICDATA:
         return "PublicData";
-        break;
     default:
         fprintf(stderr, "Unknown NCA type\n");
         exit(EXIT_FAILURE);

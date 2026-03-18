@@ -14,6 +14,15 @@
 
 /* hacPack by The-4n */
 
+/* Returns 1 if all bytes in the key are zero (key is absent), 0 otherwise. */
+static int is_key_empty(const uint8_t *key, size_t len)
+{
+    for (size_t i = 0; i < len; i++)
+        if (key[i] != 0)
+            return 0;
+    return 1;
+}
+
 // Print Usage
 static void usage(void)
 {
@@ -408,54 +417,27 @@ int main(int argc, char **argv)
     }
 
     // Make sure that header_key exists
-    uint8_t has_header_Key = 0;
-    for (unsigned int i = 0; i < 0x10; i++)
-    {
-        if (settings.keyset.header_key[i] != 0)
-        {
-            has_header_Key = 1;
-            break;
-        }
-    }
-    if (has_header_Key == 0)
+    if (is_key_empty(settings.keyset.header_key, sizeof(settings.keyset.header_key)))
     {
         fprintf(stderr, "Error: header_key is not present in keyset file\n");
         return EXIT_FAILURE;
     }
 
     // Make sure that key_area_key_application_keygen exists
-    uint8_t has_kek = 0;
-    for (unsigned int kekc = 0; kekc < 0x10; kekc++)
-    {
-        if (settings.keyset.key_area_keys[settings.keygeneration - 1][0][kekc] != 0)
-        {
-            has_kek = 1;
-            break;
-        }
-    }
-    if (has_kek == 0)
+    if (is_key_empty(settings.keyset.key_area_keys[settings.keygeneration - 1][0],
+                     sizeof(settings.keyset.key_area_keys[0][0])))
     {
         fprintf(stderr, "Error: key_area_key_application for keygeneration %i is not present in keyset file\n", settings.keygeneration);
         return EXIT_FAILURE;
     }
 
     // Make sure that titlekek_keygen exists if titlekey is specified
-    if (settings.has_title_key == 1)
+    if (settings.has_title_key == 1 &&
+        is_key_empty(settings.keyset.titlekeks[settings.keygeneration - 1],
+                     sizeof(settings.keyset.titlekeks[0])))
     {
-        uint8_t has_titlekek = 0;
-        for (unsigned int tkekc = 0; tkekc < 0x10; tkekc++)
-        {
-            if (settings.keyset.titlekeks[settings.keygeneration - 1][tkekc] != 0)
-            {
-                has_titlekek = 1;
-                break;
-            }
-        }
-        if (has_titlekek == 0)
-        {
-            fprintf(stderr, "Error: titlekek for keygeneration %i is not present in keyset file\n", settings.keygeneration);
-            return EXIT_FAILURE;
-        }
+        fprintf(stderr, "Error: titlekek for keygeneration %i is not present in keyset file\n", settings.keygeneration);
+        return EXIT_FAILURE;
     }
 
     // Make sure that titleid is within valid range
