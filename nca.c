@@ -18,6 +18,14 @@ typedef struct
     uint64_t patch_data_size;
 } nca_patch_layout_t;
 
+#define NCA_PATCH_BLOCK_SIZE 0x10
+#define NCA_PATCH_SAME_OFFSET_REUSE_MIN_SIZE 0x20
+#define NCA_PATCH_RELOCATED_REUSE_MIN_SIZE 0x40
+#define NCA_PATCH_LOCAL_SEARCH_WINDOW 0x1000
+#define NCA_PATCH_GOOD_MATCH_SIZE 0x4000
+#define NCA_PATCH_COMPARE_BUFFER_SIZE 0x4000
+#define NCA_PATCH_SOFT_SEGMENT_LIMIT (BKTR_RELOCATION_ENTRY_CAPACITY * 4)
+
 static uint64_t nca_get_file_size(FILE *file)
 {
     uint64_t current_offset = ftello64(file);
@@ -34,11 +42,27 @@ static uint32_t nca_get_section_generation(const nca_fs_header_t *fs_header)
     return generation;
 }
 
-static void nca_append_patch_segment(nca_patch_layout_t *layout, uint32_t *capacity, uint64_t virtual_offset, uint64_t size, uint32_t is_patch)
+static void nca_append_layout_segment(nca_patch_layout_t *layout, uint32_t *capacity, uint64_t virtual_offset, uint64_t size, uint64_t physical_offset, uint32_t is_patch)
 {
     if (size == 0)
     {
         return;
+    }
+
+    if (layout->segment_count > 0)
+    {
+        bktr_relocation_segment_t *last_segment = &layout->segments[layout->segment_count - 1];
+        if (last_segment->is_patch == is_patch &&
+            last_segment->virtual_offset + last_segment->size == virtual_offset &&
+            (is_patch || last_segment->physical_offset + last_segment->size == physical_offset))
+        {
+            last_segment->size += size;
+            if (is_patch)
+            {
+                layout->patch_data_size += size;
+            }
+            return;
+        }
     }
 
     if (layout->segment_count == *capacity)
@@ -55,7 +79,7 @@ static void nca_append_patch_segment(nca_patch_layout_t *layout, uint32_t *capac
 
     layout->segments[layout->segment_count].virtual_offset = virtual_offset;
     layout->segments[layout->segment_count].size = size;
-    layout->segments[layout->segment_count].physical_offset = is_patch ? layout->patch_data_size : virtual_offset;
+    layout->segments[layout->segment_count].physical_offset = physical_offset;
     layout->segments[layout->segment_count].is_patch = is_patch;
 
     if (is_patch)
@@ -66,20 +90,221 @@ static void nca_append_patch_segment(nca_patch_layout_t *layout, uint32_t *capac
     layout->segment_count++;
 }
 
+static void nca_append_patch_data_segment(nca_patch_layout_t *layout, uint32_t *capacity, uint64_t virtual_offset, uint64_t size)
+{
+    nca_append_layout_segment(layout, capacity, virtual_offset, size, layout->patch_data_size, 1);
+}
+
+static void nca_append_base_segment(nca_patch_layout_t *layout, uint32_t *capacity, uint64_t virtual_offset, uint64_t size, uint64_t base_offset)
+{
+    nca_append_layout_segment(layout, capacity, virtual_offset, size, base_offset, 0);
+}
+
+static void nca_finalize_patch_layout(nca_patch_layout_t *layout)
+{
+    uint32_t out_index = 0;
+    uint64_t patch_data_size = 0;
+
+    for (uint32_t i = 0; i < layout->segment_count; i++)
+    {
+        bktr_relocation_segment_t segment = layout->segments[i];
+        if (segment.size == 0)
+        {
+            continue;
+        }
+
+        if (segment.is_patch)
+        {
+            segment.physical_offset = patch_data_size;
+            patch_data_size += segment.size;
+        }
+
+        if (out_index > 0)
+        {
+            bktr_relocation_segment_t *previous = &layout->segments[out_index - 1];
+            if (previous->is_patch == segment.is_patch &&
+                previous->virtual_offset + previous->size == segment.virtual_offset &&
+                (segment.is_patch || previous->physical_offset + previous->size == segment.physical_offset))
+            {
+                previous->size += segment.size;
+                continue;
+            }
+        }
+
+        layout->segments[out_index++] = segment;
+    }
+
+    layout->segment_count = out_index;
+    layout->patch_data_size = patch_data_size;
+}
+
+static void nca_absorb_small_base_segments(nca_patch_layout_t *layout, uint64_t max_size)
+{
+    for (uint32_t i = 0; i < layout->segment_count; i++)
+    {
+        if (layout->segments[i].is_patch != 0 || layout->segments[i].size > max_size)
+        {
+            continue;
+        }
+
+        if ((i > 0 && layout->segments[i - 1].is_patch != 0) ||
+            (i + 1 < layout->segment_count && layout->segments[i + 1].is_patch != 0))
+        {
+            layout->segments[i].is_patch = 1;
+        }
+    }
+
+    nca_finalize_patch_layout(layout);
+}
+
 static void nca_build_full_patch_layout(nca_patch_layout_t *layout, uint64_t size)
 {
     uint32_t capacity = 0;
 
     free(layout->segments);
     memset(layout, 0, sizeof(*layout));
-    nca_append_patch_segment(layout, &capacity, 0, size, 1);
+    nca_append_patch_data_segment(layout, &capacity, 0, size);
+}
+
+static void nca_read_file_exact(FILE *file, uint64_t offset, void *buffer, size_t size, const char *error_message)
+{
+    fseeko64(file, offset, SEEK_SET);
+    if (fread(buffer, 1, size, file) != size)
+    {
+        FATAL_ERROR(error_message);
+    }
+}
+
+static uint64_t nca_measure_base_match(FILE *base_file, uint64_t base_size, uint64_t base_offset, FILE *current_file, uint64_t current_size, uint64_t current_offset)
+{
+    unsigned char base_buffer[NCA_PATCH_COMPARE_BUFFER_SIZE];
+    unsigned char current_buffer[NCA_PATCH_COMPARE_BUFFER_SIZE];
+    uint64_t remaining_size = base_size - base_offset;
+    uint64_t current_remaining_size = current_size - current_offset;
+    uint64_t matched_size = 0;
+
+    if (current_remaining_size < remaining_size)
+    {
+        remaining_size = current_remaining_size;
+    }
+
+    remaining_size -= (remaining_size % NCA_PATCH_BLOCK_SIZE);
+    while (remaining_size > 0)
+    {
+        uint64_t read_size = remaining_size;
+        if (read_size > sizeof(base_buffer))
+        {
+            read_size = sizeof(base_buffer);
+        }
+        read_size -= (read_size % NCA_PATCH_BLOCK_SIZE);
+
+        nca_read_file_exact(base_file, base_offset + matched_size, base_buffer, (size_t)read_size, "Failed to read base RomFS section");
+        nca_read_file_exact(current_file, current_offset + matched_size, current_buffer, (size_t)read_size, "Failed to read current RomFS section");
+
+        if (memcmp(base_buffer, current_buffer, (size_t)read_size) == 0)
+        {
+            matched_size += read_size;
+            remaining_size -= read_size;
+            continue;
+        }
+
+        for (uint64_t i = 0; i < read_size; i += NCA_PATCH_BLOCK_SIZE)
+        {
+            if (memcmp(base_buffer + i, current_buffer + i, NCA_PATCH_BLOCK_SIZE) != 0)
+            {
+                return matched_size + i;
+            }
+        }
+
+        matched_size += read_size;
+        remaining_size -= read_size;
+    }
+
+    return matched_size;
+}
+
+static uint64_t nca_find_base_match(FILE *base_file, uint64_t base_size, FILE *current_file, uint64_t current_size, uint64_t current_offset, uint64_t *out_base_offset)
+{
+    unsigned char current_block[NCA_PATCH_BLOCK_SIZE];
+    unsigned char base_block[NCA_PATCH_BLOCK_SIZE];
+    uint64_t best_offset = 0;
+    uint64_t best_size = 0;
+
+    if (current_offset + NCA_PATCH_BLOCK_SIZE > current_size)
+    {
+        return 0;
+    }
+
+    nca_read_file_exact(current_file, current_offset, current_block, sizeof(current_block), "Failed to read current RomFS section");
+
+    if (current_offset + NCA_PATCH_BLOCK_SIZE <= base_size)
+    {
+        nca_read_file_exact(base_file, current_offset, base_block, sizeof(base_block), "Failed to read base RomFS section");
+        if (memcmp(base_block, current_block, sizeof(current_block)) == 0)
+        {
+            best_offset = current_offset;
+            best_size = nca_measure_base_match(base_file, base_size, current_offset, current_file, current_size, current_offset);
+            if (best_size >= NCA_PATCH_GOOD_MATCH_SIZE)
+            {
+                *out_base_offset = best_offset;
+                return best_size;
+            }
+        }
+    }
+
+    for (uint64_t delta = NCA_PATCH_BLOCK_SIZE; delta <= NCA_PATCH_LOCAL_SEARCH_WINDOW; delta += NCA_PATCH_BLOCK_SIZE)
+    {
+        uint64_t candidate_offsets[2];
+        uint32_t candidate_count = 0;
+
+        if (current_offset >= delta)
+        {
+            candidate_offsets[candidate_count++] = current_offset - delta;
+        }
+        if (current_offset + delta + NCA_PATCH_BLOCK_SIZE <= base_size)
+        {
+            candidate_offsets[candidate_count++] = current_offset + delta;
+        }
+
+        for (uint32_t i = 0; i < candidate_count; i++)
+        {
+            uint64_t candidate_offset = candidate_offsets[i];
+            uint64_t candidate_size;
+
+            nca_read_file_exact(base_file, candidate_offset, base_block, sizeof(base_block), "Failed to read base RomFS section");
+            if (memcmp(base_block, current_block, sizeof(current_block)) != 0)
+            {
+                continue;
+            }
+
+            candidate_size = nca_measure_base_match(base_file, base_size, candidate_offset, current_file, current_size, current_offset);
+            if (candidate_size >= NCA_PATCH_RELOCATED_REUSE_MIN_SIZE && candidate_size > best_size)
+            {
+                best_offset = candidate_offset;
+                best_size = candidate_size;
+            }
+        }
+
+        if (best_size >= NCA_PATCH_GOOD_MATCH_SIZE)
+        {
+            break;
+        }
+    }
+
+    if (best_size >= NCA_PATCH_SAME_OFFSET_REUSE_MIN_SIZE)
+    {
+        *out_base_offset = best_offset;
+        return best_size;
+    }
+
+    return 0;
 }
 
 static void nca_build_patch_layout(FILE *base_file, uint64_t base_size, FILE *current_file, uint64_t current_size, nca_patch_layout_t *layout)
 {
-    const uint64_t block_size = 0x10;
-    const uint64_t compare_buffer_size = 0x100000;
     uint32_t capacity = 0;
+    uint64_t pending_patch_offset = UINT64_MAX;
+    static const uint64_t merge_thresholds[] = {0x20, 0x40, 0x80, 0x100, 0x200, 0x400};
 
     free(layout->segments);
     memset(layout, 0, sizeof(*layout));
@@ -90,95 +315,52 @@ static void nca_build_patch_layout(FILE *base_file, uint64_t base_size, FILE *cu
         return;
     }
 
-    unsigned char *current_buffer = malloc(compare_buffer_size);
-    unsigned char *base_buffer = malloc(compare_buffer_size);
-    if (current_buffer == NULL || base_buffer == NULL)
-    {
-        free(current_buffer);
-        free(base_buffer);
-        FATAL_ERROR("Failed to allocate BKTR compare buffer");
-    }
-
-    fseeko64(base_file, 0, SEEK_SET);
-    fseeko64(current_file, 0, SEEK_SET);
-
     uint64_t offset = 0;
-    uint64_t segment_start = 0;
-    int has_segment = 0;
-    int current_is_patch = 1;
-
     while (offset < current_size)
     {
-        uint64_t read_size = compare_buffer_size;
-        if (offset + read_size > current_size)
+        uint64_t base_match_offset = 0;
+        uint64_t base_match_size = nca_find_base_match(base_file, base_size, current_file, current_size, offset, &base_match_offset);
+
+        if (base_match_size > 0)
         {
-            read_size = current_size - offset;
-        }
+            if (pending_patch_offset != UINT64_MAX)
+            {
+                nca_append_patch_data_segment(layout, &capacity, pending_patch_offset, offset - pending_patch_offset);
+                pending_patch_offset = UINT64_MAX;
+            }
 
-        if (fread(current_buffer, 1, read_size, current_file) != read_size)
+            nca_append_base_segment(layout, &capacity, offset, base_match_size, base_match_offset);
+            offset += base_match_size;
+        }
+        else
         {
-            free(current_buffer);
-            free(base_buffer);
-            FATAL_ERROR("Failed to read current RomFS section");
+            if (pending_patch_offset == UINT64_MAX)
+            {
+                pending_patch_offset = offset;
+            }
+            offset += NCA_PATCH_BLOCK_SIZE;
         }
-
-        uint64_t base_read_size = 0;
-        if (offset < base_size)
-        {
-            base_read_size = read_size;
-            if (offset + base_read_size > base_size)
-            {
-                base_read_size = base_size - offset;
-            }
-
-            if (fread(base_buffer, 1, base_read_size, base_file) != base_read_size)
-            {
-                free(current_buffer);
-                free(base_buffer);
-                FATAL_ERROR("Failed to read base RomFS section");
-            }
-        }
-
-        for (uint64_t i = 0; i < read_size; i += block_size)
-        {
-            uint64_t global_offset = offset + i;
-            int is_patch = 1;
-
-            if (global_offset + block_size <= base_size &&
-                i + block_size <= base_read_size &&
-                memcmp(current_buffer + i, base_buffer + i, block_size) == 0)
-            {
-                is_patch = 0;
-            }
-
-            if (!has_segment)
-            {
-                has_segment = 1;
-                current_is_patch = is_patch;
-                segment_start = global_offset;
-            }
-            else if (current_is_patch != is_patch)
-            {
-                nca_append_patch_segment(layout, &capacity, segment_start, global_offset - segment_start, (uint32_t)current_is_patch);
-                current_is_patch = is_patch;
-                segment_start = global_offset;
-            }
-        }
-
-        offset += read_size;
     }
 
-    if (has_segment)
+    if (pending_patch_offset != UINT64_MAX)
     {
-        nca_append_patch_segment(layout, &capacity, segment_start, current_size - segment_start, (uint32_t)current_is_patch);
+        nca_append_patch_data_segment(layout, &capacity, pending_patch_offset, current_size - pending_patch_offset);
     }
 
-    free(current_buffer);
-    free(base_buffer);
+    nca_finalize_patch_layout(layout);
 
-    if (layout->segment_count == 0 || layout->segment_count > BKTR_RELOCATION_ENTRY_CAPACITY)
+    for (size_t i = 0; i < (sizeof(merge_thresholds) / sizeof(merge_thresholds[0])); i++)
     {
-        printf("BKTR diff too fragmented, falling back to full replacement patch data\n");
+        if (layout->segment_count <= NCA_PATCH_SOFT_SEGMENT_LIMIT)
+        {
+            break;
+        }
+        nca_absorb_small_base_segments(layout, merge_thresholds[i]);
+    }
+
+    if (layout->segment_count == 0 || layout->segment_count > BKTR_MAX_RELOCATION_ENTRY_COUNT)
+    {
+        printf("BKTR diff still too fragmented, falling back to full replacement patch data\n");
         nca_build_full_patch_layout(layout, current_size);
     }
 }
@@ -303,6 +485,7 @@ static void nca_prepare_romfs_fs_header(nca_fs_header_t *fs_header, uint8_t cryp
 
 static uint64_t nca_build_patch_romfs_section(filepath_t *base_section_path, filepath_t *current_section_path, filepath_t *out_section_path, nca_fs_header_t *fs_header)
 {
+    bktr_subsection_entry_t subsection_entry;
     FILE *current_section = os_fopen(current_section_path->os_path, OS_MODE_READ);
     if (current_section == NULL)
     {
@@ -357,8 +540,15 @@ static uint64_t nca_build_patch_romfs_section(filepath_t *base_section_path, fil
     nca_write_padding(patch_section);
 
     const uint64_t relocation_offset = (uint64_t)ftello64(patch_section);
-    unsigned char *relocation_table = calloc(1, BKTR_RELOCATION_TABLE_SIZE);
-    unsigned char *subsection_table = calloc(1, BKTR_SUBSECTION_TABLE_SIZE);
+    const uint32_t relocation_entry_count = layout.segment_count;
+    const uint64_t relocation_table_size = bktr_get_relocation_table_size(relocation_entry_count);
+    unsigned char *relocation_table = calloc(1, (size_t)relocation_table_size);
+    subsection_entry.offset = 0;
+    subsection_entry.reserved = 0;
+    subsection_entry.ctr_val = nca_get_section_generation(fs_header);
+    const uint32_t subsection_entry_count = 1;
+    const uint64_t subsection_table_size = bktr_get_subsection_table_size(subsection_entry_count);
+    unsigned char *subsection_table = calloc(1, (size_t)subsection_table_size);
     if (relocation_table == NULL || subsection_table == NULL)
     {
         free(relocation_table);
@@ -366,8 +556,8 @@ static uint64_t nca_build_patch_romfs_section(filepath_t *base_section_path, fil
         FATAL_ERROR("Failed to allocate BKTR tables");
     }
 
-    bktr_build_relocation_table(relocation_table, current_size, layout.segments, layout.segment_count);
-    if (fwrite(relocation_table, 1, BKTR_RELOCATION_TABLE_SIZE, patch_section) != BKTR_RELOCATION_TABLE_SIZE)
+    bktr_build_relocation_table(relocation_table, relocation_table_size, current_size, layout.segments, relocation_entry_count);
+    if (fwrite(relocation_table, 1, (size_t)relocation_table_size, patch_section) != relocation_table_size)
     {
         free(relocation_table);
         free(subsection_table);
@@ -375,8 +565,8 @@ static uint64_t nca_build_patch_romfs_section(filepath_t *base_section_path, fil
     }
 
     const uint64_t subsection_offset = (uint64_t)ftello64(patch_section);
-    bktr_build_subsection_table(subsection_table, subsection_offset, relocation_offset, nca_get_section_generation(fs_header));
-    if (fwrite(subsection_table, 1, BKTR_SUBSECTION_TABLE_SIZE, patch_section) != BKTR_SUBSECTION_TABLE_SIZE)
+    bktr_build_subsection_table(subsection_table, subsection_table_size, subsection_offset, relocation_offset, &subsection_entry, subsection_entry_count);
+    if (fwrite(subsection_table, 1, (size_t)subsection_table_size, patch_section) != subsection_table_size)
     {
         free(relocation_table);
         free(subsection_table);
@@ -398,16 +588,16 @@ static uint64_t nca_build_patch_romfs_section(filepath_t *base_section_path, fil
 
     fs_header->crypt_type = CRYPT_BKTR;
     fs_header->bktr_superblock.relocation_header.offset = relocation_offset;
-    fs_header->bktr_superblock.relocation_header.size = BKTR_RELOCATION_TABLE_SIZE;
+    fs_header->bktr_superblock.relocation_header.size = relocation_table_size;
     fs_header->bktr_superblock.relocation_header.magic = MAGIC_BKTR;
     fs_header->bktr_superblock.relocation_header.version = BKTR_VERSION;
-    fs_header->bktr_superblock.relocation_header.num_entries = layout.segment_count;
+    fs_header->bktr_superblock.relocation_header.num_entries = relocation_entry_count;
     fs_header->bktr_superblock.relocation_header.reserved = 0;
     fs_header->bktr_superblock.subsection_header.offset = subsection_offset;
-    fs_header->bktr_superblock.subsection_header.size = BKTR_SUBSECTION_TABLE_SIZE;
+    fs_header->bktr_superblock.subsection_header.size = subsection_table_size;
     fs_header->bktr_superblock.subsection_header.magic = MAGIC_BKTR;
     fs_header->bktr_superblock.subsection_header.version = BKTR_VERSION;
-    fs_header->bktr_superblock.subsection_header.num_entries = 1;
+    fs_header->bktr_superblock.subsection_header.num_entries = subsection_entry_count;
     fs_header->bktr_superblock.subsection_header.reserved = 0;
 
     return section_size;
